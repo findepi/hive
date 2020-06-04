@@ -20,6 +20,10 @@ package org.apache.hadoop.hive.ql.parse;
 
 import com.google.common.collect.Interner;
 import com.google.common.collect.Interners;
+import com.google.common.collect.Lists;
+
+import org.apache.commons.collections.CollectionUtils;
+import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.common.HiveStatsUtils;
 import org.apache.hadoop.hive.conf.HiveConf;
@@ -28,9 +32,18 @@ import org.apache.hadoop.hive.metastore.api.MetaException;
 import org.apache.hadoop.hive.ql.Context;
 import org.apache.hadoop.hive.ql.ErrorMsg;
 import org.apache.hadoop.hive.ql.QueryState;
-import org.apache.hadoop.hive.ql.exec.DDLTask;
+import org.apache.hadoop.hive.ql.ddl.DDLDesc;
+import org.apache.hadoop.hive.ql.ddl.DDLTask;
+import org.apache.hadoop.hive.ql.ddl.DDLWork;
+import org.apache.hadoop.hive.ql.ddl.table.creation.CreateTableDesc;
+import org.apache.hadoop.hive.ql.ddl.view.AlterMaterializedViewRewriteDesc;
+import org.apache.hadoop.hive.ql.ddl.view.CreateViewDesc;
+import org.apache.hadoop.hive.ql.ddl.view.MaterializedViewUpdateDesc;
 import org.apache.hadoop.hive.ql.exec.FetchTask;
-import org.apache.hadoop.hive.ql.exec.MaterializedViewDesc;
+import org.apache.hadoop.hive.ql.exec.FileSinkOperator;
+import org.apache.hadoop.hive.ql.exec.MoveTask;
+import org.apache.hadoop.hive.ql.exec.Operator;
+import org.apache.hadoop.hive.ql.exec.OperatorUtils;
 import org.apache.hadoop.hive.ql.exec.StatsTask;
 import org.apache.hadoop.hive.ql.exec.TableScanOperator;
 import org.apache.hadoop.hive.ql.exec.Task;
@@ -49,19 +62,18 @@ import org.apache.hadoop.hive.ql.parse.BaseSemanticAnalyzer.AnalyzeRewriteContex
 import org.apache.hadoop.hive.ql.parse.BaseSemanticAnalyzer.TableSpec;
 import org.apache.hadoop.hive.ql.plan.BasicStatsWork;
 import org.apache.hadoop.hive.ql.plan.ColumnStatsDesc;
-import org.apache.hadoop.hive.ql.plan.CreateTableDesc;
-import org.apache.hadoop.hive.ql.plan.CreateViewDesc;
-import org.apache.hadoop.hive.ql.plan.DDLWork;
 import org.apache.hadoop.hive.ql.plan.FetchWork;
 import org.apache.hadoop.hive.ql.plan.FileSinkDesc;
 import org.apache.hadoop.hive.ql.plan.LoadFileDesc;
 import org.apache.hadoop.hive.ql.plan.LoadTableDesc;
 import org.apache.hadoop.hive.ql.plan.MoveWork;
+import org.apache.hadoop.hive.ql.plan.OperatorDesc;
 import org.apache.hadoop.hive.ql.plan.PlanUtils;
 import org.apache.hadoop.hive.ql.plan.StatsWork;
 import org.apache.hadoop.hive.ql.plan.TableDesc;
 import org.apache.hadoop.hive.ql.session.SessionState;
 import org.apache.hadoop.hive.ql.session.SessionState.LogHelper;
+import org.apache.hadoop.hive.ql.stats.BasicStatsNoJobTask;
 import org.apache.hadoop.hive.serde.serdeConstants;
 import org.apache.hadoop.hive.serde2.DefaultFetchFormatter;
 import org.apache.hadoop.hive.serde2.NoOpFetchFormatter;
@@ -75,6 +87,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.Serializable;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -104,7 +117,7 @@ public abstract class TaskCompiler {
     this.console = console;
   }
 
-  @SuppressWarnings({"nls", "unchecked"})
+  @SuppressWarnings("nls")
   public void compile(final ParseContext pCtx,
       final List<Task<? extends Serializable>> rootTasks,
       final HashSet<ReadEntity> inputs, final HashSet<WriteEntity> outputs) throws SemanticException {
@@ -163,7 +176,7 @@ public abstract class TaskCompiler {
       if (resultTab == null) {
         resFileFormat = HiveConf.getVar(conf, HiveConf.ConfVars.HIVEQUERYRESULTFILEFORMAT);
         if (SessionState.get().getIsUsingThriftJDBCBinarySerDe()
-            && (resFileFormat.equalsIgnoreCase("SequenceFile"))) {
+            && ("SequenceFile".equalsIgnoreCase(resFileFormat))) {
           resultTab =
               PlanUtils.getDefaultQueryOutputTableDesc(cols, colTypes, resFileFormat,
                   ThriftJDBCBinarySerDe.class);
@@ -171,9 +184,18 @@ public abstract class TaskCompiler {
           // read formatted thrift objects from the output SequenceFile written by Tasks.
           conf.set(SerDeUtils.LIST_SINK_OUTPUT_FORMATTER, NoOpFetchFormatter.class.getName());
         } else {
+          if("SequenceFile".equalsIgnoreCase(resFileFormat)) {
+            // file format is changed so that IF file sink provides list of files to fetch from (instead
+            // of whle directory) list status is done on files (which is what HiveSequenceFileInputFormat do)
+            resultTab =
+                PlanUtils.getDefaultQueryOutputTableDesc(cols, colTypes, "HiveSequenceFile",
+                                                         LazySimpleSerDe.class);
+
+          } else {
           resultTab =
               PlanUtils.getDefaultQueryOutputTableDesc(cols, colTypes, resFileFormat,
                   LazySimpleSerDe.class);
+        }
         }
       } else {
         if (resultTab.getProperties().getProperty(serdeConstants.SERIALIZATION_LIB)
@@ -196,6 +218,19 @@ public abstract class TaskCompiler {
           fetch.setIsUsingThriftJDBCBinarySerDe(true);
       } else {
           fetch.setIsUsingThriftJDBCBinarySerDe(false);
+      }
+
+      // The idea here is to keep an object reference both in FileSink and in FetchTask for list of files
+      // to be fetched. During Job close file sink will populate the list and fetch task later will use it
+      // to fetch the results.
+      Collection<Operator<? extends OperatorDesc>> tableScanOps =
+          Lists.<Operator<?>>newArrayList(pCtx.getTopOps().values());
+      Set<FileSinkOperator> fsOps = OperatorUtils.findOperators(tableScanOps, FileSinkOperator.class);
+      if(fsOps != null && fsOps.size() == 1) {
+        FileSinkOperator op = fsOps.iterator().next();
+        Set<FileStatus> filesToFetch =  new HashSet<>();
+        op.getConf().setFilesToFetch(filesToFetch);
+        fetch.setFilesToFetch(filesToFetch);
       }
 
       pCtx.setFetchTask((FetchTask) TaskFactory.get(fetch));
@@ -323,22 +358,24 @@ public abstract class TaskCompiler {
       // generate a DDL task and make it a dependent task of the leaf
       CreateTableDesc crtTblDesc = pCtx.getCreateTable();
       crtTblDesc.validate(conf);
-      Task<? extends Serializable> crtTblTask = TaskFactory.get(new DDLWork(
-          inputs, outputs, crtTblDesc));
-      patchUpAfterCTASorMaterializedView(rootTasks, outputs, crtTblTask);
+      Task<? extends Serializable> crtTblTask = TaskFactory.get(new DDLWork(inputs, outputs, crtTblDesc));
+      patchUpAfterCTASorMaterializedView(rootTasks, inputs, outputs, crtTblTask,
+          CollectionUtils.isEmpty(crtTblDesc.getPartColNames()));
     } else if (pCtx.getQueryProperties().isMaterializedView()) {
       // generate a DDL task and make it a dependent task of the leaf
       CreateViewDesc viewDesc = pCtx.getCreateViewDesc();
       Task<? extends Serializable> crtViewTask = TaskFactory.get(new DDLWork(
           inputs, outputs, viewDesc));
-      patchUpAfterCTASorMaterializedView(rootTasks, outputs, crtViewTask);
+      patchUpAfterCTASorMaterializedView(rootTasks, inputs, outputs, crtViewTask,
+          CollectionUtils.isEmpty(viewDesc.getPartColNames()));
     } else if (pCtx.getMaterializedViewUpdateDesc() != null) {
       // If there is a materialized view update desc, we create introduce it at the end
       // of the tree.
-      MaterializedViewDesc materializedViewDesc = pCtx.getMaterializedViewUpdateDesc();
+      MaterializedViewUpdateDesc materializedViewDesc = pCtx.getMaterializedViewUpdateDesc();
+      DDLWork ddlWork = new DDLWork(inputs, outputs, materializedViewDesc);
       Set<Task<? extends Serializable>> leafTasks = new LinkedHashSet<Task<? extends Serializable>>();
       getLeafTasks(rootTasks, leafTasks);
-      Task<? extends Serializable> materializedViewTask = TaskFactory.get(materializedViewDesc, conf);
+      Task<? extends Serializable> materializedViewTask = TaskFactory.get(ddlWork, conf);
       for (Task<? extends Serializable> task : leafTasks) {
         task.addDependentTask(materializedViewTask);
       }
@@ -381,7 +418,9 @@ public abstract class TaskCompiler {
     TableSpec tableSpec = new TableSpec(table, partitions);
     tableScan.getConf().getTableMetadata().setTableSpec(tableSpec);
 
-    if (inputFormat.equals(OrcInputFormat.class)) {
+    // Note: this should probably use BasicStatsNoJobTask.canUseFooterScan, but it doesn't check
+    //       Parquet for some reason. I'm keeping the existing behavior for now.
+    if (inputFormat.equals(OrcInputFormat.class) && !AcidUtils.isTransactionalTable(table)) {
       // For ORC, there is no Tez Job for table stats.
       StatsWork columnStatsWork = new StatsWork(table, parseContext.getConf());
       columnStatsWork.setFooterScan();
@@ -403,22 +442,25 @@ public abstract class TaskCompiler {
   private void setLoadFileLocation(
       final ParseContext pCtx, LoadFileDesc lfd) throws SemanticException {
     // CTAS; make the movetask's destination directory the table's destination.
-    Long txnIdForCtas = null;
-    int stmtId = 0; // CTAS cannot be part of multi-txn stmt
-    FileSinkDesc dataSinkForCtas = null;
+    Long txnId = null;
+    int stmtId = 0; // CTAS or CMV cannot be part of multi-txn stmt
+    FileSinkDesc dataSink = null;
     String loc = null;
     if (pCtx.getQueryProperties().isCTAS()) {
       CreateTableDesc ctd = pCtx.getCreateTable();
-      dataSinkForCtas = ctd.getAndUnsetWriter();
-      txnIdForCtas = ctd.getInitialMmWriteId();
+      dataSink = ctd.getAndUnsetWriter();
+      txnId = ctd.getInitialMmWriteId();
       loc = ctd.getLocation();
     } else {
-      loc = pCtx.getCreateViewDesc().getLocation();
+      CreateViewDesc cmv = pCtx.getCreateViewDesc();
+      dataSink = cmv.getAndUnsetWriter();
+      txnId = cmv.getInitialMmWriteId();
+      loc = cmv.getLocation();
     }
     Path location = (loc == null) ? getDefaultCtasLocation(pCtx) : new Path(loc);
-    if (txnIdForCtas != null) {
-      dataSinkForCtas.setDirName(location);
-      location = new Path(location, AcidUtils.deltaSubdir(txnIdForCtas, txnIdForCtas, stmtId));
+    if (txnId != null) {
+      dataSink.setDirName(location);
+      location = new Path(location, AcidUtils.deltaSubdir(txnId, txnId, stmtId));
       lfd.setSourcePath(location);
       if (Utilities.FILE_OP_LOGGER.isTraceEnabled()) {
         Utilities.FILE_OP_LOGGER.trace("Setting MM CTAS to " + location);
@@ -454,9 +496,9 @@ public abstract class TaskCompiler {
     }
   }
 
-  private void patchUpAfterCTASorMaterializedView(final List<Task<? extends Serializable>>  rootTasks,
-                                                  final HashSet<WriteEntity> outputs,
-                                                  Task<? extends Serializable> createTask) {
+  private void patchUpAfterCTASorMaterializedView(List<Task<? extends Serializable>> rootTasks,
+      Set<ReadEntity> inputs, Set<WriteEntity> outputs, Task<? extends Serializable> createTask,
+      boolean createTaskAfterMoveTask) {
     // clear the mapredWork output file from outputs for CTAS
     // DDLWork at the tail of the chain will have the output
     Iterator<WriteEntity> outIter = outputs.iterator();
@@ -472,20 +514,34 @@ public abstract class TaskCompiler {
     }
 
     // find all leaf tasks and make the DDLTask as a dependent task on all of them
-    HashSet<Task<? extends Serializable>> leaves = new LinkedHashSet<>();
+    Set<Task<? extends Serializable>> leaves = new LinkedHashSet<>();
     getLeafTasks(rootTasks, leaves);
     assert (leaves.size() > 0);
+    // Target task is supposed to be the last task
     Task<? extends Serializable> targetTask = createTask;
     for (Task<? extends Serializable> task : leaves) {
       if (task instanceof StatsTask) {
         // StatsTask require table to already exist
         for (Task<? extends Serializable> parentOfStatsTask : task.getParentTasks()) {
-          parentOfStatsTask.addDependentTask(createTask);
+          if (parentOfStatsTask instanceof MoveTask && !createTaskAfterMoveTask) {
+            // For partitioned CTAS, we need to create the table before the move task
+            // as we need to create the partitions in metastore and for that we should
+            // have already registered the table
+            interleaveTask(parentOfStatsTask, createTask);
+          } else {
+            parentOfStatsTask.addDependentTask(createTask);
+          }
         }
         for (Task<? extends Serializable> parentOfCrtTblTask : createTask.getParentTasks()) {
           parentOfCrtTblTask.removeDependentTask(task);
         }
         createTask.addDependentTask(task);
+        targetTask = task;
+      } else if (task instanceof MoveTask && !createTaskAfterMoveTask) {
+        // For partitioned CTAS, we need to create the table before the move task
+        // as we need to create the partitions in metastore and for that we should
+        // have already registered the table
+        interleaveTask(task, createTask);
         targetTask = task;
       } else {
         task.addDependentTask(createTask);
@@ -494,28 +550,43 @@ public abstract class TaskCompiler {
 
     // Add task to insert / delete materialized view from registry if needed
     if (createTask instanceof DDLTask) {
-      DDLTask ddlTask = (DDLTask) createTask;
+      DDLTask ddlTask = (DDLTask)createTask;
       DDLWork work = ddlTask.getWork();
-      String tableName = null;
-      boolean retrieveAndInclude = false;
-      boolean disableRewrite = false;
-      if (work.getCreateViewDesc() != null && work.getCreateViewDesc().isMaterialized()) {
-        tableName = work.getCreateViewDesc().getViewName();
-        retrieveAndInclude = work.getCreateViewDesc().isRewriteEnabled();
-      } else if (work.getAlterMaterializedViewDesc() != null) {
-        tableName = work.getAlterMaterializedViewDesc().getMaterializedViewName();
-        if (work.getAlterMaterializedViewDesc().isRewriteEnable()) {
-          retrieveAndInclude = true;
-        } else {
-          disableRewrite = true;
+      DDLDesc desc = work.getDDLDesc();
+      if (desc instanceof CreateViewDesc) {
+        CreateViewDesc createViewDesc = (CreateViewDesc)desc;
+        if (createViewDesc.isMaterialized()) {
+          String tableName = createViewDesc.getViewName();
+          boolean retrieveAndInclude = createViewDesc.isRewriteEnabled();
+          MaterializedViewUpdateDesc materializedViewUpdateDesc =
+              new MaterializedViewUpdateDesc(tableName, retrieveAndInclude, false, false);
+          DDLWork ddlWork = new DDLWork(inputs, outputs, materializedViewUpdateDesc);
+          targetTask.addDependentTask(TaskFactory.get(ddlWork, conf));
         }
-      } else {
-        return;
+      } else if (desc instanceof AlterMaterializedViewRewriteDesc) {
+        AlterMaterializedViewRewriteDesc alterMVRewriteDesc = (AlterMaterializedViewRewriteDesc)desc;
+        String tableName = alterMVRewriteDesc.getMaterializedViewName();
+        boolean retrieveAndInclude = alterMVRewriteDesc.isRewriteEnable();
+        boolean disableRewrite = !alterMVRewriteDesc.isRewriteEnable();
+        MaterializedViewUpdateDesc materializedViewUpdateDesc =
+            new MaterializedViewUpdateDesc(tableName, retrieveAndInclude, disableRewrite, false);
+        DDLWork ddlWork = new DDLWork(inputs, outputs, materializedViewUpdateDesc);
+        targetTask.addDependentTask(TaskFactory.get(ddlWork, conf));
       }
-      targetTask.addDependentTask(
-          TaskFactory.get(
-              new MaterializedViewDesc(tableName, retrieveAndInclude, disableRewrite, false), conf));
     }
+  }
+
+  /**
+   * Makes dependentTask dependent of task.
+   */
+  private void interleaveTask(Task<? extends Serializable> dependentTask, Task<? extends Serializable> task) {
+    for (Task<? extends Serializable> parentOfStatsTask : dependentTask.getParentTasks()) {
+      parentOfStatsTask.addDependentTask(task);
+    }
+    for (Task<? extends Serializable> parentOfCrtTblTask : task.getParentTasks()) {
+      parentOfCrtTblTask.removeDependentTask(dependentTask);
+    }
+    task.addDependentTask(dependentTask);
   }
 
   /**
@@ -527,7 +598,6 @@ public abstract class TaskCompiler {
    * appropriate metadata to be used during execution.
    *
    */
-  @SuppressWarnings("unchecked")
   protected void genColumnStatsTask(AnalyzeRewriteContext analyzeRewrite,
       List<LoadFileDesc> loadFileWork, Map<String, StatsTask> map,
       int outerQueryLimit, int numBitVector) throws SemanticException {

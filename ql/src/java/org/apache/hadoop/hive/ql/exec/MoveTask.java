@@ -32,6 +32,7 @@ import org.apache.hadoop.hive.metastore.utils.MetaStoreUtils;
 import org.apache.hadoop.hive.ql.Context;
 import org.apache.hadoop.hive.ql.DriverContext;
 import org.apache.hadoop.hive.ql.ErrorMsg;
+import org.apache.hadoop.hive.ql.ddl.DDLUtils;
 import org.apache.hadoop.hive.ql.exec.mr.MapRedTask;
 import org.apache.hadoop.hive.ql.exec.mr.MapredLocalTask;
 import org.apache.hadoop.hive.ql.hooks.LineageInfo.DataContainer;
@@ -43,13 +44,14 @@ import org.apache.hadoop.hive.ql.lockmgr.HiveLock;
 import org.apache.hadoop.hive.ql.lockmgr.HiveLockManager;
 import org.apache.hadoop.hive.ql.lockmgr.HiveLockObj;
 import org.apache.hadoop.hive.ql.lockmgr.LockException;
+import org.apache.hadoop.hive.ql.exec.repl.util.ReplUtils;
+import org.apache.hadoop.hive.ql.log.PerfLogger;
 import org.apache.hadoop.hive.ql.metadata.Hive;
 import org.apache.hadoop.hive.ql.metadata.HiveException;
 import org.apache.hadoop.hive.ql.metadata.Partition;
 import org.apache.hadoop.hive.ql.metadata.Table;
 import org.apache.hadoop.hive.ql.optimizer.physical.BucketingSortingCtx.BucketCol;
 import org.apache.hadoop.hive.ql.optimizer.physical.BucketingSortingCtx.SortCol;
-import org.apache.hadoop.hive.ql.parse.BaseSemanticAnalyzer;
 import org.apache.hadoop.hive.ql.parse.ExplainConfiguration.AnalyzeState;
 import org.apache.hadoop.hive.ql.plan.DynamicPartitionCtx;
 import org.apache.hadoop.hive.ql.plan.LoadFileDesc;
@@ -60,6 +62,8 @@ import org.apache.hadoop.hive.ql.plan.MapWork;
 import org.apache.hadoop.hive.ql.plan.MapredWork;
 import org.apache.hadoop.hive.ql.plan.MoveWork;
 import org.apache.hadoop.hive.ql.plan.api.StageType;
+import org.apache.hadoop.hive.ql.util.DirectionUtils;
+import org.apache.hadoop.hive.ql.session.SessionState;
 import org.apache.hadoop.util.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -85,9 +89,16 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
     super();
   }
 
+  public boolean canExecuteInParallel(){
+    return false;
+  }
+
   private void moveFile(Path sourcePath, Path targetPath, boolean isDfsDir)
       throws HiveException {
     try {
+      PerfLogger perfLogger = SessionState.getPerfLogger();
+      perfLogger.PerfLogBegin("MoveTask", PerfLogger.FILE_MOVES);
+
       String mesg = "Moving data to " + (isDfsDir ? "" : "local ") + "directory "
           + targetPath.toString();
       String mesg_detail = " from " + sourcePath.toString();
@@ -101,6 +112,8 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
         FileSystem dstFs = FileSystem.getLocal(conf);
         moveFileFromDfsToLocal(sourcePath, targetPath, fs, dstFs);
       }
+
+      perfLogger.PerfLogEnd("MoveTask", PerfLogger.FILE_MOVES);
     } catch (Exception e) {
       throw new HiveException("Unable to move source " + sourcePath + " to destination "
           + targetPath, e);
@@ -132,7 +145,11 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
       if (HiveConf.getBoolVar(conf, HiveConf.ConfVars.HIVE_INSERT_INTO_MULTILEVEL_DIRS)) {
         deletePath = createTargetPath(targetPath, tgtFs);
       }
-      Hive.clearDestForSubDirSrc(conf, targetPath, sourcePath, false);
+      //For acid table incremental replication, just copy the content of staging directory to destination.
+      //No need to clean it.
+      if (work.isNeedCleanTarget()) {
+        Hive.clearDestForSubDirSrc(conf, targetPath, sourcePath, false);
+      }
       // Set isManaged to false as this is not load data operation for which it is needed.
       if (!Hive.moveFile(conf, sourcePath, targetPath, true, false, false)) {
         try {
@@ -257,6 +274,25 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
     return false;
   }
 
+  // Whether statistics need to be reset as part of MoveTask execution.
+  private boolean resetStatisticsProps(Table table) {
+    if (hasFollowingStatsTask()) {
+      // If there's a follow-on stats task then the stats will be correct after load, so don't
+      // need to reset the statistics.
+      return false;
+    }
+
+    if (!work.getIsInReplicationScope()) {
+      // If the load is not happening during replication and there is not follow-on stats
+      // task, stats will be inaccurate after load and so need to be reset.
+      return true;
+    }
+
+    // If we are loading a table during replication, the stats will also be replicated
+    // and hence accurate. No need to reset those.
+    return false;
+  }
+
   private final static class TaskInformation {
     public List<BucketCol> bucketCols = null;
     public List<SortCol> sortCols = null;
@@ -311,6 +347,7 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
           }
         }
       }
+
       // Multi-file load is for dynamic partitions when some partitions do not
       // need to merge and they can simply be moved to the target directory.
       // This is also used for MM table conversion.
@@ -321,6 +358,9 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
         for (int i = 0; i <lmfd.getSourceDirs().size(); ++i) {
           Path srcPath = lmfd.getSourceDirs().get(i);
           Path destPath = lmfd.getTargetDirs().get(i);
+          if (destPath.equals(srcPath)) {
+            continue;
+          }
           String filePrefix = targetPrefixes == null ? null : targetPrefixes.get(i);
           FileSystem destFs = destPath.getFileSystem(conf);
           if (filePrefix == null) {
@@ -360,6 +400,17 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
 
         checkFileFormats(db, tbd, table);
 
+        // for transactional table if write id is not set during replication from a cluster with STRICT_MANAGED set
+        // to false then set it now.
+        if (tbd.getWriteId() <= 0 && AcidUtils.isTransactionalTable(table.getParameters())) {
+          Long writeId = ReplUtils.getMigrationCurrentTblWriteId(conf);
+          if (writeId == null) {
+            throw new HiveException("MoveTask : Write id is not set in the config by open txn task for migration");
+          }
+          tbd.setWriteId(writeId);
+          tbd.setStmtId(driverContext.getCtx().getHiveTxnManager().getStmtIdAndIncrement());
+        }
+
         boolean isFullAcidOp = work.getLoadTableWork().getWriteType() != AcidUtils.Operation.NOT_ACID
             && !tbd.isMmTable(); //it seems that LoadTableDesc has Operation.INSERT only for CTAS...
 
@@ -371,11 +422,13 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
             Utilities.FILE_OP_LOGGER.trace("loadTable called from " + tbd.getSourcePath()
               + " into " + tbd.getTable().getTableName());
           }
+
           db.loadTable(tbd.getSourcePath(), tbd.getTable().getTableName(), tbd.getLoadFileType(),
-              work.isSrcLocal(), isSkewedStoredAsDirs(tbd), isFullAcidOp, hasFollowingStatsTask(),
-              tbd.getWriteId(), tbd.getStmtId(), tbd.isInsertOverwrite());
+                  work.isSrcLocal(), isSkewedStoredAsDirs(tbd), isFullAcidOp,
+                  resetStatisticsProps(table), tbd.getWriteId(), tbd.getStmtId(),
+                  tbd.isInsertOverwrite());
           if (work.getOutputs() != null) {
-            DDLTask.addIfAbsentByName(new WriteEntity(table,
+            DDLUtils.addIfAbsentByName(new WriteEntity(table,
               getWriteType(tbd, work.getLoadTableWork().getWriteType())), work.getOutputs());
           }
         } else {
@@ -470,12 +523,12 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
     }
 
     db.loadPartition(tbd.getSourcePath(), db.getTable(tbd.getTable().getTableName()),
-        tbd.getPartitionSpec(), tbd.getLoadFileType(), tbd.getInheritTableSpecs(),
-        isSkewedStoredAsDirs(tbd), work.isSrcLocal(),
-         work.getLoadTableWork().getWriteType() != AcidUtils.Operation.NOT_ACID &&
-            !tbd.isMmTable(),
-         hasFollowingStatsTask(),
-        tbd.getWriteId(), tbd.getStmtId(), tbd.isInsertOverwrite());
+            tbd.getPartitionSpec(), tbd.getLoadFileType(), tbd.getInheritTableSpecs(),
+            tbd.getInheritLocation(), isSkewedStoredAsDirs(tbd), work.isSrcLocal(),
+            work.getLoadTableWork().getWriteType() != AcidUtils.Operation.NOT_ACID &&
+                    !tbd.isMmTable(),
+            resetStatisticsProps(table), tbd.getWriteId(), tbd.getStmtId(),
+            tbd.isInsertOverwrite());
     Partition partn = db.getPartition(table, tbd.getPartitionSpec(), false);
 
     // See the comment inside updatePartitionBucketSortColumns.
@@ -487,7 +540,7 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
     DataContainer dc = new DataContainer(table.getTTable(), partn.getTPartition());
     // add this partition to post-execution hook
     if (work.getOutputs() != null) {
-      DDLTask.addIfAbsentByName(new WriteEntity(partn,
+      DDLUtils.addIfAbsentByName(new WriteEntity(partn,
         getWriteType(tbd, work.getLoadTableWork().getWriteType())), work.getOutputs());
     }
     return dc;
@@ -520,7 +573,7 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
             !tbd.isMmTable(),
         work.getLoadTableWork().getWriteId(),
         tbd.getStmtId(),
-        hasFollowingStatsTask(),
+        resetStatisticsProps(table),
         work.getLoadTableWork().getWriteType(),
         tbd.isInsertOverwrite());
 
@@ -554,7 +607,7 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
       WriteEntity enty = new WriteEntity(partn,
         getWriteType(tbd, work.getLoadTableWork().getWriteType()));
       if (work.getOutputs() != null) {
-        DDLTask.addIfAbsentByName(enty, work.getOutputs());
+        DDLUtils.addIfAbsentByName(enty, work.getOutputs());
       }
       // Need to update the queryPlan's output as well so that post-exec hook get executed.
       // This is only needed for dynamic partitioning since for SP the the WriteEntity is
@@ -770,9 +823,8 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
       for (SortCol sortCol : sortCols) {
         if (sortCol.getIndexes().get(0) < partn.getCols().size()) {
           newSortCols.add(new Order(
-            partn.getCols().get(sortCol.getIndexes().get(0)).getName(),
-            sortCol.getSortOrder() == '+' ? BaseSemanticAnalyzer.HIVE_COLUMN_ORDER_ASC :
-              BaseSemanticAnalyzer.HIVE_COLUMN_ORDER_DESC));
+              partn.getCols().get(sortCol.getIndexes().get(0)).getName(),
+              DirectionUtils.signToCode(sortCol.getSortOrder())));
         } else {
           // If the table is sorted on a partition column, not valid for sorting
           updateSortCols = false;
@@ -786,7 +838,8 @@ public class MoveTask extends Task<MoveWork> implements Serializable {
     }
 
     if (updateBucketCols || updateSortCols) {
-      db.alterPartition(table.getDbName(), table.getTableName(), partn, null);
+      db.alterPartition(table.getCatalogName(), table.getDbName(), table.getTableName(),
+          partn, null, true);
     }
   }
 

@@ -26,6 +26,7 @@ import java.util.List;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.ql.exec.Task;
 import org.apache.hadoop.hive.ql.hooks.ReadEntity;
+import org.apache.hadoop.hive.ql.hooks.WriteEntity;
 import org.apache.hadoop.hive.ql.parse.BaseSemanticAnalyzer;
 import org.apache.hadoop.hive.ql.parse.ExplainConfiguration;
 import org.apache.hadoop.hive.ql.parse.ExplainConfiguration.VectorizationDetailLevel;
@@ -42,6 +43,7 @@ public class ExplainWork implements Serializable {
   private ArrayList<Task<? extends Serializable>> rootTasks;
   private Task<? extends Serializable> fetchTask;
   private HashSet<ReadEntity> inputs;
+  private HashSet<WriteEntity> outputs;
   private ParseContext pCtx;
 
   private ExplainConfiguration config;
@@ -49,6 +51,9 @@ public class ExplainWork implements Serializable {
   boolean appendTaskType;
 
   String cboInfo;
+  String cboPlan;
+
+  private String optimizedSQL;
 
   private transient BaseSemanticAnalyzer analyzer;
 
@@ -61,7 +66,9 @@ public class ExplainWork implements Serializable {
       Task<? extends Serializable> fetchTask,
       BaseSemanticAnalyzer analyzer,
       ExplainConfiguration config,
-      String cboInfo) {
+      String cboInfo,
+      String optimizedSQL,
+      String cboPlan) {
     this.resFile = resFile;
     this.rootTasks = new ArrayList<Task<? extends Serializable>>(rootTasks);
     this.fetchTask = fetchTask;
@@ -69,8 +76,13 @@ public class ExplainWork implements Serializable {
     if (analyzer != null) {
       this.inputs = analyzer.getInputs();
     }
+    if (analyzer != null) {
+      this.outputs = analyzer.getAllOutputs();
+    }
     this.pCtx = pCtx;
     this.cboInfo = cboInfo;
+    this.optimizedSQL = optimizedSQL;
+    this.cboPlan = cboPlan;
     this.config = config;
   }
 
@@ -106,6 +118,14 @@ public class ExplainWork implements Serializable {
     this.inputs = inputs;
   }
 
+  public HashSet<WriteEntity> getOutputs() {
+    return outputs;
+  }
+
+  public void setOutputs(HashSet<WriteEntity> outputs) {
+    this.outputs = outputs;
+  }
+
   public boolean getExtended() {
     return config.isExtended();
   }
@@ -130,12 +150,20 @@ public class ExplainWork implements Serializable {
     return config.getVectorizationDetailLevel();
   }
 
+  public boolean isDebug() {
+    return config.isDebug();
+  }
+
   public ParseContext getParseContext() {
     return pCtx;
   }
 
   public void setParseContext(ParseContext pCtx) {
     this.pCtx = pCtx;
+  }
+
+  public boolean isCbo() {
+    return config.isCbo();
   }
 
   public boolean isLogical() {
@@ -170,12 +198,32 @@ public class ExplainWork implements Serializable {
     this.cboInfo = cboInfo;
   }
 
+  public String getOptimizedSQL() {
+    return optimizedSQL;
+  }
+
+  public void setOptimizedSQL(String optimizedSQL) {
+    this.optimizedSQL = optimizedSQL;
+  }
+
+  public String getCboPlan() {
+    return cboPlan;
+  }
+
+  public void setCboPlan(String cboPlan) {
+    this.cboPlan = cboPlan;
+  }
+
   public ExplainConfiguration getConfig() {
     return config;
   }
 
   public void setConfig(ExplainConfiguration config) {
     this.config = config;
+  }
+
+  public boolean isLocks() {
+    return config.isLocks();
   }
 
 }

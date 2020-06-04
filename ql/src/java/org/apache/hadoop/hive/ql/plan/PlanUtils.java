@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -31,6 +32,7 @@ import java.util.Set;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hive.common.JavaUtils;
+import org.apache.hadoop.hive.common.StatsSetupConst;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
 import org.apache.hadoop.hive.llap.LlapOutputFormat;
@@ -38,12 +40,15 @@ import org.apache.hadoop.hive.metastore.HiveMetaStoreUtils;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
 import org.apache.hadoop.hive.metastore.utils.MetaStoreUtils;
+import org.apache.hadoop.hive.ql.ddl.table.creation.CreateTableDesc;
+import org.apache.hadoop.hive.ql.ddl.view.CreateViewDesc;
 import org.apache.hadoop.hive.ql.exec.ColumnInfo;
 import org.apache.hadoop.hive.ql.exec.RowSchema;
 import org.apache.hadoop.hive.ql.exec.TableScanOperator;
 import org.apache.hadoop.hive.ql.exec.Utilities;
 import org.apache.hadoop.hive.ql.hooks.ReadEntity;
 import org.apache.hadoop.hive.ql.io.AcidUtils;
+import org.apache.hadoop.hive.ql.io.HiveSequenceFileInputFormat;
 import org.apache.hadoop.hive.ql.io.IgnoreKeyTextOutputFormat;
 import org.apache.hadoop.hive.ql.io.RCFileInputFormat;
 import org.apache.hadoop.hive.ql.io.RCFileOutputFormat;
@@ -70,6 +75,7 @@ import org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe;
 import org.apache.hadoop.hive.serde2.lazybinary.LazyBinarySerDe;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
+import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapred.InputFormat;
 import org.apache.hadoop.mapred.JobConf;
 import org.apache.hadoop.mapred.OutputFormat;
@@ -78,6 +84,7 @@ import org.apache.hadoop.mapred.SequenceFileOutputFormat;
 import org.apache.hadoop.mapred.TextInputFormat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import static org.apache.hive.common.util.HiveStringUtils.quoteComments;
 
 /**
  * PlanUtils.
@@ -276,7 +283,10 @@ public final class PlanUtils {
 
     Class inputFormat, outputFormat;
     // get the input & output file formats
-    if ("SequenceFile".equalsIgnoreCase(fileFormat)) {
+    if ("HiveSequenceFile".equalsIgnoreCase(fileFormat)) {
+      inputFormat = HiveSequenceFileInputFormat.class;
+      outputFormat = SequenceFileOutputFormat.class;
+    } else if ("SequenceFile".equalsIgnoreCase(fileFormat)) {
       inputFormat = SequenceFileInputFormat.class;
       outputFormat = SequenceFileOutputFormat.class;
     } else if ("RCFile".equalsIgnoreCase(fileFormat)) {
@@ -978,6 +988,14 @@ public final class PlanUtils {
       if (storageHandler != null) {
         storageHandler.configureJobConf(tableDesc, jobConf);
       }
+      if (tableDesc.getJobSecrets() != null) {
+        for (Map.Entry<String, String> entry : tableDesc.getJobSecrets().entrySet()) {
+          String key = TableDesc.SECRET_PREFIX + TableDesc.SECRET_DELIMIT +
+                  tableDesc.getTableName() + TableDesc.SECRET_DELIMIT + entry.getKey();
+          jobConf.getCredentials().addSecretKey(new Text(key), entry.getValue().getBytes());
+        }
+        tableDesc.getJobSecrets().clear();
+      }
     } catch (HiveException e) {
       throw new RuntimeException(e);
     }
@@ -1202,5 +1220,33 @@ public final class PlanUtils {
    */
   public static Class<? extends AbstractSerDe> getDefaultSerDe() {
     return LazySimpleSerDe.class;
+  }
+
+  /**
+   * Get a Map of table or partition properties to be used in explain extended output.
+   * Do some filtering to make output readable and/or concise.
+   */
+  static Map getPropertiesExplain(Properties properties) {
+    if (properties != null) {
+      Map<Object, Object> clone = null;
+      String value = properties.getProperty("columns.comments");
+      if (value != null) {
+        // should copy properties first
+        clone = new HashMap<>(properties);
+        clone.put("columns.comments", quoteComments(value));
+      }
+      value = properties.getProperty(StatsSetupConst.NUM_ERASURE_CODED_FILES);
+      if ("0".equals(value)) {
+        // should copy properties first
+        if (clone == null) {
+          clone = new HashMap<>(properties);
+        }
+        clone.remove(StatsSetupConst.NUM_ERASURE_CODED_FILES);
+      }
+      if (clone != null) {
+        return clone;
+      }
+    }
+    return properties;
   }
 }

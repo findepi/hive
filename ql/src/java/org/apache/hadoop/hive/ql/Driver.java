@@ -33,15 +33,11 @@ import java.util.LinkedHashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
 import java.util.Queue;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
-
-import com.google.common.annotations.VisibleForTesting;
 
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.lang3.tuple.ImmutablePair;
@@ -62,7 +58,6 @@ import org.apache.hadoop.hive.conf.VariableSubstitution;
 import org.apache.hadoop.hive.metastore.ColumnType;
 import org.apache.hadoop.hive.metastore.HiveMetaStoreUtils;
 import org.apache.hadoop.hive.metastore.Warehouse;
-import org.apache.hadoop.hive.metastore.api.Database;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.LockComponent;
 import org.apache.hadoop.hive.metastore.api.LockType;
@@ -71,14 +66,12 @@ import org.apache.hadoop.hive.metastore.utils.MetaStoreUtils;
 import org.apache.hadoop.hive.ql.cache.results.CacheUsage;
 import org.apache.hadoop.hive.ql.cache.results.QueryResultsCache;
 import org.apache.hadoop.hive.ql.cache.results.QueryResultsCache.CacheEntry;
+import org.apache.hadoop.hive.ql.ddl.DDLDesc.DDLDescWithWriteId;
 import org.apache.hadoop.hive.ql.exec.AbstractFileMergeOperator;
 import org.apache.hadoop.hive.ql.exec.ConditionalTask;
 import org.apache.hadoop.hive.ql.exec.DagUtils;
 import org.apache.hadoop.hive.ql.exec.ExplainTask;
 import org.apache.hadoop.hive.ql.exec.FetchTask;
-import org.apache.hadoop.hive.ql.exec.FunctionInfo;
-import org.apache.hadoop.hive.ql.exec.FunctionUtils;
-import org.apache.hadoop.hive.ql.exec.FunctionInfo.FunctionType;
 import org.apache.hadoop.hive.ql.exec.Operator;
 import org.apache.hadoop.hive.ql.exec.TableScanOperator;
 import org.apache.hadoop.hive.ql.exec.Task;
@@ -86,15 +79,17 @@ import org.apache.hadoop.hive.ql.exec.TaskFactory;
 import org.apache.hadoop.hive.ql.exec.TaskResult;
 import org.apache.hadoop.hive.ql.exec.TaskRunner;
 import org.apache.hadoop.hive.ql.exec.Utilities;
+import org.apache.hadoop.hive.ql.exec.repl.util.ReplUtils;
 import org.apache.hadoop.hive.ql.history.HiveHistory.Keys;
 import org.apache.hadoop.hive.ql.hooks.Entity;
-import org.apache.hadoop.hive.ql.hooks.Entity.Type;
 import org.apache.hadoop.hive.ql.hooks.HookContext;
 import org.apache.hadoop.hive.ql.hooks.HookUtils;
 import org.apache.hadoop.hive.ql.hooks.PrivateHookContext;
 import org.apache.hadoop.hive.ql.hooks.ReadEntity;
 import org.apache.hadoop.hive.ql.hooks.WriteEntity;
 import org.apache.hadoop.hive.ql.io.AcidUtils;
+import org.apache.hadoop.hive.ql.lock.CompileLock;
+import org.apache.hadoop.hive.ql.lock.CompileLockFactory;
 import org.apache.hadoop.hive.ql.lockmgr.HiveLock;
 import org.apache.hadoop.hive.ql.lockmgr.HiveLockMode;
 import org.apache.hadoop.hive.ql.lockmgr.HiveTxnManager;
@@ -103,39 +98,25 @@ import org.apache.hadoop.hive.ql.log.PerfLogger;
 import org.apache.hadoop.hive.ql.metadata.AuthorizationException;
 import org.apache.hadoop.hive.ql.metadata.Hive;
 import org.apache.hadoop.hive.ql.metadata.HiveException;
-import org.apache.hadoop.hive.ql.metadata.Partition;
 import org.apache.hadoop.hive.ql.metadata.Table;
 import org.apache.hadoop.hive.ql.metadata.formatting.JsonMetaDataFormatter;
 import org.apache.hadoop.hive.ql.metadata.formatting.MetaDataFormatUtils;
 import org.apache.hadoop.hive.ql.metadata.formatting.MetaDataFormatter;
-import org.apache.hadoop.hive.ql.optimizer.ppr.PartitionPruner;
 import org.apache.hadoop.hive.ql.parse.ASTNode;
 import org.apache.hadoop.hive.ql.parse.BaseSemanticAnalyzer;
-import org.apache.hadoop.hive.ql.parse.ColumnAccessInfo;
 import org.apache.hadoop.hive.ql.parse.ExplainConfiguration.AnalyzeState;
 import org.apache.hadoop.hive.ql.parse.HiveSemanticAnalyzerHookContext;
 import org.apache.hadoop.hive.ql.parse.HiveSemanticAnalyzerHookContextImpl;
-import org.apache.hadoop.hive.ql.parse.ImportSemanticAnalyzer;
-import org.apache.hadoop.hive.ql.parse.ParseContext;
 import org.apache.hadoop.hive.ql.parse.ParseException;
 import org.apache.hadoop.hive.ql.parse.ParseUtils;
-import org.apache.hadoop.hive.ql.parse.PrunedPartitionList;
-import org.apache.hadoop.hive.ql.parse.SemanticAnalyzer;
 import org.apache.hadoop.hive.ql.parse.SemanticAnalyzerFactory;
-import org.apache.hadoop.hive.ql.plan.DDLDesc.DDLDescWithWriteId;
 import org.apache.hadoop.hive.ql.plan.FileSinkDesc;
 import org.apache.hadoop.hive.ql.plan.HiveOperation;
 import org.apache.hadoop.hive.ql.plan.TableDesc;
 import org.apache.hadoop.hive.ql.plan.mapper.PlanMapper;
 import org.apache.hadoop.hive.ql.plan.mapper.StatsSource;
 import org.apache.hadoop.hive.ql.processors.CommandProcessorResponse;
-import org.apache.hadoop.hive.ql.security.authorization.AuthorizationUtils;
-import org.apache.hadoop.hive.ql.security.authorization.HiveAuthorizationProvider;
-import org.apache.hadoop.hive.ql.security.authorization.plugin.HiveAuthzContext;
-import org.apache.hadoop.hive.ql.security.authorization.plugin.HiveOperationType;
-import org.apache.hadoop.hive.ql.security.authorization.plugin.HivePrivilegeObject;
-import org.apache.hadoop.hive.ql.security.authorization.plugin.HivePrivilegeObject.HivePrivObjectActionType;
-import org.apache.hadoop.hive.ql.security.authorization.plugin.HivePrivilegeObject.HivePrivilegeObjectType;
+import org.apache.hadoop.hive.ql.security.authorization.command.CommandAuthorizer;
 import org.apache.hadoop.hive.ql.session.LineageState;
 import org.apache.hadoop.hive.ql.session.SessionState;
 import org.apache.hadoop.hive.ql.session.SessionState.LogHelper;
@@ -147,13 +128,14 @@ import org.apache.hadoop.mapred.JobConf;
 import org.apache.hadoop.mapreduce.MRJobConfig;
 import org.apache.hive.common.util.ShutdownHookManager;
 import org.apache.hive.common.util.TxnIdUtils;
+import org.apache.thrift.TException;
+import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.Sets;
-
 
 public class Driver implements IDriver {
 
@@ -168,7 +150,6 @@ public class Driver implements IDriver {
   ByteStream.Output bos = new ByteStream.Output();
 
   private final HiveConf conf;
-  private final boolean isParallelEnabled;
   private DataInput resStream;
   private Context ctx;
   private DriverContext driverCxt;
@@ -220,6 +201,7 @@ public class Driver implements IDriver {
   private CacheUsage cacheUsage;
   private CacheEntry usedCacheEntry;
   private ValidWriteIdList compactionWriteIds = null;
+  private long compactorTxnId = 0;
 
   private Context backupContext = null;
   private boolean retrial = false;
@@ -449,8 +431,6 @@ public class Driver implements IDriver {
   public Driver(QueryState queryState, String userName, QueryInfo queryInfo, HiveTxnManager txnMgr) {
     this.queryState = queryState;
     this.conf = queryState.getConf();
-    isParallelEnabled = (conf != null)
-        && HiveConf.getBoolVar(conf, ConfVars.HIVE_SERVER2_PARALLEL_COMPILATION);
     this.userName = userName;
     this.hookRunner = new HookRunner(conf, console);
     this.queryInfo = queryInfo;
@@ -502,9 +482,9 @@ public class Driver implements IDriver {
   // deferClose indicates if the close/destroy should be deferred when the process has been
   // interrupted, it should be set to true if the compile is called within another method like
   // runInternal, which defers the close to the called in that method.
-  private void compile(String command, boolean resetTaskIds, boolean deferClose) throws CommandProcessorResponse {
-    PerfLogger perfLogger = SessionState.getPerfLogger(true);
-    perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.DRIVER_RUN);
+  @VisibleForTesting
+  void compile(String command, boolean resetTaskIds, boolean deferClose) throws CommandProcessorResponse {
+    PerfLogger perfLogger = SessionState.getPerfLogger();
     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.COMPILE);
     lDrvState.stateLock.lock();
     try {
@@ -542,7 +522,8 @@ public class Driver implements IDriver {
 
     LockedDriverState.setLockedDriverState(lDrvState);
 
-    String queryId = queryState.getQueryId();
+    final String queryId = Strings.isNullOrEmpty(queryState.getQueryId()) ?
+        QueryPlan.makeQueryId() : queryState.getQueryId();
 
     if (ctx != null) {
       setTriggerContext(queryId);
@@ -652,6 +633,10 @@ public class Driver implements IDriver {
       BaseSemanticAnalyzer sem = SemanticAnalyzerFactory.get(queryState, tree);
 
       if (!retrial) {
+        if ((queryState.getHiveOperation() != null)
+                && queryState.getHiveOperation().equals(HiveOperation.REPLDUMP)) {
+          setLastReplIdForDump(queryState.getConf());
+        }
         openTransaction();
         generateValidTxnList();
       }
@@ -678,8 +663,11 @@ public class Driver implements IDriver {
 
       // get the output schema
       schema = getSchema(sem, conf);
-      plan = new QueryPlan(queryStr, sem, perfLogger.getStartTime(PerfLogger.DRIVER_RUN), queryId,
-        queryState.getHiveOperation(), schema);
+      plan = new QueryPlan(queryStr, sem, queryDisplay.getQueryStartTime(), queryId,
+          queryState.getHiveOperation(), schema);
+      // save the optimized plan and sql for the explain
+      plan.setOptimizedCBOPlan(ctx.getCalcitePlan());
+      plan.setOptimizedQueryString(ctx.getOptimizedSql());
 
       conf.set("mapreduce.workflow.id", "hive_" + queryId);
       conf.set("mapreduce.workflow.name", queryStr);
@@ -695,7 +683,12 @@ public class Driver implements IDriver {
 
         try {
           perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.DO_AUTHORIZATION);
-          doAuthorization(queryState.getHiveOperation(), sem, command);
+          // Authorization check for kill query will be in KillQueryImpl
+          // As both admin or operation owner can perform the operation.
+          // Which is not directly supported in authorizer
+          if (queryState.getHiveOperation() != HiveOperation.KILL_QUERY) {
+            CommandAuthorizer.doAuthorization(queryState.getHiveOperation(), sem, command);
+          }
         } catch (AuthorizationException authExp) {
           console.printError("Authorization failed:" + authExp.getMessage()
               + ". Use SHOW GRANT to get more details.");
@@ -707,12 +700,15 @@ public class Driver implements IDriver {
         }
       }
 
-      if (conf.getBoolVar(ConfVars.HIVE_LOG_EXPLAIN_OUTPUT)) {
+      if (conf.getBoolVar(ConfVars.HIVE_LOG_EXPLAIN_OUTPUT)
+          || conf.getBoolVar(ConfVars.HIVE_SERVER2_WEBUI_EXPLAIN_OUTPUT)) {
         String explainOutput = getExplainOutput(sem, plan, tree);
         if (explainOutput != null) {
-          LOG.info("EXPLAIN output for queryid " + queryId + " : "
-            + explainOutput);
-          if (conf.isWebUiQueryInfoCacheEnabled()) {
+          if (conf.getBoolVar(ConfVars.HIVE_LOG_EXPLAIN_OUTPUT)) {
+            LOG.info("EXPLAIN output for queryid " + queryId + " : " + explainOutput);
+          }
+          if (conf.isWebUiQueryInfoCacheEnabled()
+              && conf.getBoolVar(ConfVars.HIVE_SERVER2_WEBUI_EXPLAIN_OUTPUT)) {
             queryDisplay.setExplainPlan(explainOutput);
           }
         }
@@ -893,6 +889,22 @@ public class Driver implements IDriver {
     ctx.setWmContext(wmContext);
   }
 
+  /**
+   * Last repl id should be captured before opening txn by current REPL DUMP operation.
+   * This is needed to avoid losing data which are added/modified by concurrent txns when bootstrap
+   * dump in progress.
+   * @param conf Query configurations
+   * @throws HiveException
+   * @throws TException
+   */
+  private void setLastReplIdForDump(HiveConf conf) throws HiveException, TException {
+    // Last logged notification event id would be the last repl Id for the current REPl DUMP.
+    Hive hiveDb = Hive.get();
+    Long lastReplId = hiveDb.getMSC().getCurrentNotificationEventId().getEventId();
+    conf.setLong(ReplUtils.LAST_REPL_ID_KEY, lastReplId);
+    LOG.debug("Setting " + ReplUtils.LAST_REPL_ID_KEY + " = " + lastReplId);
+  }
+
   private void openTransaction() throws LockException, CommandProcessorResponse {
     if (checkConcurrency() && startImplicitTxn(queryTxnMgr)) {
       String userFromUGI = getUserFromUGI();
@@ -900,7 +912,7 @@ public class Driver implements IDriver {
         if (userFromUGI == null) {
           throw createProcessorResponse(10);
         }
-        long txnid = queryTxnMgr.openTxn(ctx, userFromUGI);
+        queryTxnMgr.openTxn(ctx, userFromUGI);
       }
     }
   }
@@ -1005,379 +1017,27 @@ public class Driver implements IDriver {
     PrintStream ps = new PrintStream(baos);
     try {
       List<Task<?>> rootTasks = sem.getAllRootTasks();
-      task.getJSONPlan(ps, rootTasks, sem.getFetchTask(), false, true, true);
-      ret = baos.toString();
+      if (conf.getBoolVar(ConfVars.HIVE_SERVER2_WEBUI_SHOW_GRAPH)) {
+        JSONObject jsonPlan = task.getJSONPlan(
+            null, rootTasks, sem.getFetchTask(), true, true, true, sem.getCboInfo(),
+            plan.getOptimizedQueryString(), plan.getOptimizedQueryString());
+        if (jsonPlan.getJSONObject(ExplainTask.STAGE_DEPENDENCIES) != null &&
+            jsonPlan.getJSONObject(ExplainTask.STAGE_DEPENDENCIES).length() <=
+                conf.getIntVar(ConfVars.HIVE_SERVER2_WEBUI_MAX_GRAPH_SIZE)) {
+          ret = jsonPlan.toString();
+        } else {
+          ret = null;
+        }
+      } else {
+        task.getJSONPlan(ps, rootTasks, sem.getFetchTask(), false, true, true, sem.getCboInfo(),
+            plan.getOptimizedQueryString(), plan.getOptimizedQueryString());
+        ret = baos.toString();
+      }
     } catch (Exception e) {
       LOG.warn("Exception generating explain output: " + e, e);
     }
 
     return ret;
-  }
-
-  /**
-   * Do authorization using post semantic analysis information in the semantic analyzer
-   * The original command is also passed so that authorization interface can provide
-   * more useful information in logs.
-   * @param sem SemanticAnalyzer used to parse input query
-   * @param command input query
-   * @throws HiveException
-   * @throws AuthorizationException
-   */
-  public static void doAuthorization(HiveOperation op, BaseSemanticAnalyzer sem, String command)
-      throws HiveException, AuthorizationException {
-    SessionState ss = SessionState.get();
-    Hive db = sem.getDb();
-
-    Set<ReadEntity> additionalInputs = new HashSet<ReadEntity>();
-    for (Entity e : sem.getInputs()) {
-      if (e.getType() == Entity.Type.PARTITION) {
-        additionalInputs.add(new ReadEntity(e.getTable()));
-      }
-    }
-
-    Set<WriteEntity> additionalOutputs = new HashSet<WriteEntity>();
-    for (WriteEntity e : sem.getOutputs()) {
-      if (e.getType() == Entity.Type.PARTITION) {
-        additionalOutputs.add(new WriteEntity(e.getTable(), e.getWriteType()));
-      }
-    }
-
-    // The following union operation returns a union, which traverses over the
-    // first set once and then  then over each element of second set, in order,
-    // that is not contained in first. This means it doesn't replace anything
-    // in first set, and would preserve the WriteType in WriteEntity in first
-    // set in case of outputs list.
-    Set<ReadEntity> inputs = Sets.union(sem.getInputs(), additionalInputs);
-    Set<WriteEntity> outputs = Sets.union(sem.getOutputs(), additionalOutputs);
-
-    if (ss.isAuthorizationModeV2()) {
-      // get mapping of tables to columns used
-      ColumnAccessInfo colAccessInfo = sem.getColumnAccessInfo();
-      // colAccessInfo is set only in case of SemanticAnalyzer
-      Map<String, List<String>> selectTab2Cols = colAccessInfo != null
-          ? colAccessInfo.getTableToColumnAccessMap() : null;
-      Map<String, List<String>> updateTab2Cols = sem.getUpdateColumnAccessInfo() != null
-          ? sem.getUpdateColumnAccessInfo().getTableToColumnAccessMap() : null;
-
-      // convert to List as above Set was created using Sets.union (for reasons
-      // explained there)
-      // but that Set is immutable
-      List<ReadEntity> inputList = new ArrayList<ReadEntity>(inputs);
-      List<WriteEntity> outputList = new ArrayList<WriteEntity>(outputs);
-
-      // add permanent UDFs being used
-      inputList.addAll(getPermanentFunctionEntities(ss));
-
-      doAuthorizationV2(ss, op, inputList, outputList, command, selectTab2Cols, updateTab2Cols);
-      return;
-    }
-    if (op == null) {
-      throw new HiveException("Operation should not be null");
-    }
-    HiveAuthorizationProvider authorizer = ss.getAuthorizer();
-    if (op.equals(HiveOperation.CREATEDATABASE)) {
-      authorizer.authorize(
-          op.getInputRequiredPrivileges(), op.getOutputRequiredPrivileges());
-    } else if (op.equals(HiveOperation.CREATETABLE_AS_SELECT)
-        || op.equals(HiveOperation.CREATETABLE)) {
-      authorizer.authorize(
-          db.getDatabase(SessionState.get().getCurrentDatabase()), null,
-          HiveOperation.CREATETABLE_AS_SELECT.getOutputRequiredPrivileges());
-    } else {
-      if (op.equals(HiveOperation.IMPORT)) {
-        ImportSemanticAnalyzer isa = (ImportSemanticAnalyzer) sem;
-        if (!isa.existsTable()) {
-          authorizer.authorize(
-              db.getDatabase(SessionState.get().getCurrentDatabase()), null,
-              HiveOperation.CREATETABLE_AS_SELECT.getOutputRequiredPrivileges());
-        }
-      }
-    }
-    if (outputs != null && outputs.size() > 0) {
-      for (WriteEntity write : outputs) {
-        if (write.isDummy() || write.isPathType()) {
-          continue;
-        }
-        if (write.getType() == Entity.Type.DATABASE) {
-          if (!op.equals(HiveOperation.IMPORT)){
-            // We skip DB check for import here because we already handle it above
-            // as a CTAS check.
-            authorizer.authorize(write.getDatabase(),
-                null, op.getOutputRequiredPrivileges());
-          }
-          continue;
-        }
-
-        if (write.getType() == WriteEntity.Type.PARTITION) {
-          Partition part = db.getPartition(write.getTable(), write
-              .getPartition().getSpec(), false);
-          if (part != null) {
-            authorizer.authorize(write.getPartition(), null,
-                    op.getOutputRequiredPrivileges());
-            continue;
-          }
-        }
-
-        if (write.getTable() != null) {
-          authorizer.authorize(write.getTable(), null,
-                  op.getOutputRequiredPrivileges());
-        }
-      }
-    }
-
-    if (inputs != null && inputs.size() > 0) {
-      Map<Table, List<String>> tab2Cols = new HashMap<Table, List<String>>();
-      Map<Partition, List<String>> part2Cols = new HashMap<Partition, List<String>>();
-
-      //determine if partition level privileges should be checked for input tables
-      Map<String, Boolean> tableUsePartLevelAuth = new HashMap<String, Boolean>();
-      for (ReadEntity read : inputs) {
-        if (read.isDummy() || read.isPathType() || read.getType() == Entity.Type.DATABASE) {
-          continue;
-        }
-        Table tbl = read.getTable();
-        if ((read.getPartition() != null) || (tbl != null && tbl.isPartitioned())) {
-          String tblName = tbl.getTableName();
-          if (tableUsePartLevelAuth.get(tblName) == null) {
-            boolean usePartLevelPriv = (tbl.getParameters().get(
-                "PARTITION_LEVEL_PRIVILEGE") != null && ("TRUE"
-                .equalsIgnoreCase(tbl.getParameters().get(
-                    "PARTITION_LEVEL_PRIVILEGE"))));
-            if (usePartLevelPriv) {
-              tableUsePartLevelAuth.put(tblName, Boolean.TRUE);
-            } else {
-              tableUsePartLevelAuth.put(tblName, Boolean.FALSE);
-            }
-          }
-        }
-      }
-
-      // column authorization is checked through table scan operators.
-      getTablePartitionUsedColumns(op, sem, tab2Cols, part2Cols, tableUsePartLevelAuth);
-
-      // cache the results for table authorization
-      Set<String> tableAuthChecked = new HashSet<String>();
-      for (ReadEntity read : inputs) {
-        // if read is not direct, we do not need to check its autho.
-        if (read.isDummy() || read.isPathType() || !read.isDirect()) {
-          continue;
-        }
-        if (read.getType() == Entity.Type.DATABASE) {
-          authorizer.authorize(read.getDatabase(), op.getInputRequiredPrivileges(), null);
-          continue;
-        }
-        Table tbl = read.getTable();
-        if (tbl.isView() && sem instanceof SemanticAnalyzer) {
-          tab2Cols.put(tbl,
-              sem.getColumnAccessInfo().getTableToColumnAccessMap().get(tbl.getCompleteName()));
-        }
-        if (read.getPartition() != null) {
-          Partition partition = read.getPartition();
-          tbl = partition.getTable();
-          // use partition level authorization
-          if (Boolean.TRUE.equals(tableUsePartLevelAuth.get(tbl.getTableName()))) {
-            List<String> cols = part2Cols.get(partition);
-            if (cols != null && cols.size() > 0) {
-              authorizer.authorize(partition.getTable(),
-                  partition, cols, op.getInputRequiredPrivileges(),
-                  null);
-            } else {
-              authorizer.authorize(partition,
-                  op.getInputRequiredPrivileges(), null);
-            }
-            continue;
-          }
-        }
-
-        // if we reach here, it means it needs to do a table authorization
-        // check, and the table authorization may already happened because of other
-        // partitions
-        if (tbl != null && !tableAuthChecked.contains(tbl.getTableName()) &&
-            !(Boolean.TRUE.equals(tableUsePartLevelAuth.get(tbl.getTableName())))) {
-          List<String> cols = tab2Cols.get(tbl);
-          if (cols != null && cols.size() > 0) {
-            authorizer.authorize(tbl, null, cols,
-                op.getInputRequiredPrivileges(), null);
-          } else {
-            authorizer.authorize(tbl, op.getInputRequiredPrivileges(),
-                null);
-          }
-          tableAuthChecked.add(tbl.getTableName());
-        }
-      }
-
-    }
-  }
-
-  private static List<ReadEntity> getPermanentFunctionEntities(SessionState ss) throws HiveException {
-    List<ReadEntity> functionEntities = new ArrayList<>();
-    for (Entry<String, FunctionInfo> permFunction : ss.getCurrentFunctionsInUse().entrySet()) {
-      if (permFunction.getValue().getFunctionType() != FunctionType.PERSISTENT) {
-        // Only permanent functions need to be authorized.
-        // Built-in function access is allowed to all users.
-        // If user can create a temp function, they should be able to use it
-        // without additional authorization.
-        continue;
-      }
-      functionEntities.add(createReadEntity(permFunction.getKey(), permFunction.getValue()));
-    }
-    return functionEntities;
-  }
-
-  private static ReadEntity createReadEntity(String functionName, FunctionInfo functionInfo)
-      throws HiveException {
-    String[] qualFunctionName = FunctionUtils.getQualifiedFunctionNameParts(functionName);
-    // this is only for the purpose of authorization, only the name matters.
-    Database db = new Database(qualFunctionName[0], "", "", null);
-    return new ReadEntity(db, qualFunctionName[1], functionInfo.getClassName(), Type.FUNCTION);
-  }
-
-  private static void getTablePartitionUsedColumns(HiveOperation op, BaseSemanticAnalyzer sem,
-      Map<Table, List<String>> tab2Cols, Map<Partition, List<String>> part2Cols,
-      Map<String, Boolean> tableUsePartLevelAuth) throws HiveException {
-    // for a select or create-as-select query, populate the partition to column
-    // (par2Cols) or
-    // table to columns mapping (tab2Cols)
-    if (op.equals(HiveOperation.CREATETABLE_AS_SELECT) || op.equals(HiveOperation.QUERY)) {
-      SemanticAnalyzer querySem = (SemanticAnalyzer) sem;
-      ParseContext parseCtx = querySem.getParseContext();
-
-      for (Map.Entry<String, TableScanOperator> topOpMap : querySem.getParseContext().getTopOps()
-          .entrySet()) {
-        TableScanOperator tableScanOp = topOpMap.getValue();
-        if (!tableScanOp.isInsideView()) {
-          Table tbl = tableScanOp.getConf().getTableMetadata();
-          List<Integer> neededColumnIds = tableScanOp.getNeededColumnIDs();
-          List<FieldSchema> columns = tbl.getCols();
-          List<String> cols = new ArrayList<String>();
-          for (int i = 0; i < neededColumnIds.size(); i++) {
-            cols.add(columns.get(neededColumnIds.get(i)).getName());
-          }
-          // map may not contain all sources, since input list may have been
-          // optimized out
-          // or non-existent tho such sources may still be referenced by the
-          // TableScanOperator
-          // if it's null then the partition probably doesn't exist so let's use
-          // table permission
-          if (tbl.isPartitioned()
-              && Boolean.TRUE.equals(tableUsePartLevelAuth.get(tbl.getTableName()))) {
-            String alias_id = topOpMap.getKey();
-
-            PrunedPartitionList partsList = PartitionPruner.prune(tableScanOp, parseCtx, alias_id);
-            Set<Partition> parts = partsList.getPartitions();
-            for (Partition part : parts) {
-              List<String> existingCols = part2Cols.get(part);
-              if (existingCols == null) {
-                existingCols = new ArrayList<String>();
-              }
-              existingCols.addAll(cols);
-              part2Cols.put(part, existingCols);
-            }
-          } else {
-            List<String> existingCols = tab2Cols.get(tbl);
-            if (existingCols == null) {
-              existingCols = new ArrayList<String>();
-            }
-            existingCols.addAll(cols);
-            tab2Cols.put(tbl, existingCols);
-          }
-        }
-      }
-    }
-  }
-
-  private static void doAuthorizationV2(SessionState ss, HiveOperation op, List<ReadEntity> inputs,
-      List<WriteEntity> outputs, String command, Map<String, List<String>> tab2cols,
-      Map<String, List<String>> updateTab2Cols) throws HiveException {
-
-    /* comment for reviewers -> updateTab2Cols needed to be separate from tab2cols because if I
-    pass tab2cols to getHivePrivObjects for the output case it will trip up insert/selects,
-    since the insert will get passed the columns from the select.
-     */
-
-    HiveAuthzContext.Builder authzContextBuilder = new HiveAuthzContext.Builder();
-    authzContextBuilder.setUserIpAddress(ss.getUserIpAddress());
-    authzContextBuilder.setForwardedAddresses(ss.getForwardedAddresses());
-    authzContextBuilder.setCommandString(command);
-
-    HiveOperationType hiveOpType = getHiveOperationType(op);
-    List<HivePrivilegeObject> inputsHObjs = getHivePrivObjects(inputs, tab2cols);
-    List<HivePrivilegeObject> outputHObjs = getHivePrivObjects(outputs, updateTab2Cols);
-
-    ss.getAuthorizerV2().checkPrivileges(hiveOpType, inputsHObjs, outputHObjs, authzContextBuilder.build());
-  }
-
-  private static List<HivePrivilegeObject> getHivePrivObjects(
-      List<? extends Entity> privObjects, Map<String, List<String>> tableName2Cols) {
-    List<HivePrivilegeObject> hivePrivobjs = new ArrayList<HivePrivilegeObject>();
-    if(privObjects == null){
-      return hivePrivobjs;
-    }
-    for(Entity privObject : privObjects){
-      HivePrivilegeObjectType privObjType =
-          AuthorizationUtils.getHivePrivilegeObjectType(privObject.getType());
-      if(privObject.isDummy()) {
-        //do not authorize dummy readEntity or writeEntity
-        continue;
-      }
-      if(privObject instanceof ReadEntity && !((ReadEntity)privObject).isDirect()){
-        // In case of views, the underlying views or tables are not direct dependencies
-        // and are not used for authorization checks.
-        // This ReadEntity represents one of the underlying tables/views, so skip it.
-        // See description of the isDirect in ReadEntity
-        continue;
-      }
-      if(privObject instanceof WriteEntity && ((WriteEntity)privObject).isTempURI()){
-        //do not authorize temporary uris
-        continue;
-      }
-      //support for authorization on partitions needs to be added
-      String dbname = null;
-      String objName = null;
-      List<String> partKeys = null;
-      List<String> columns = null;
-      String className = null;
-      switch(privObject.getType()){
-      case DATABASE:
-        dbname = privObject.getDatabase().getName();
-        break;
-      case TABLE:
-        dbname = privObject.getTable().getDbName();
-        objName = privObject.getTable().getTableName();
-        columns = tableName2Cols == null ? null :
-            tableName2Cols.get(Table.getCompleteName(dbname, objName));
-        break;
-      case DFS_DIR:
-      case LOCAL_DIR:
-        objName = privObject.getD().toString();
-        break;
-      case FUNCTION:
-        if(privObject.getDatabase() != null) {
-          dbname = privObject.getDatabase().getName();
-        }
-        objName = privObject.getFunctionName();
-        className = privObject.getClassName();
-        break;
-      case DUMMYPARTITION:
-      case PARTITION:
-        // not currently handled
-        continue;
-      case SERVICE_NAME:
-        objName = privObject.getServiceName();
-        break;
-        default:
-          throw new AssertionError("Unexpected object type");
-      }
-      HivePrivObjectActionType actionType = AuthorizationUtils.getActionType(privObject);
-      HivePrivilegeObject hPrivObject = new HivePrivilegeObject(privObjType, dbname, objName,
-          partKeys, columns, actionType, null, className);
-      hivePrivobjs.add(hPrivObject);
-    }
-    return hivePrivobjs;
-  }
-
-  private static HiveOperationType getHiveOperationType(HiveOperation op) {
-    return HiveOperationType.valueOf(op.name());
   }
 
   @Override
@@ -1416,7 +1076,7 @@ public class Driver implements IDriver {
 
   // Write the current set of valid write ids for the operated acid tables into the conf file so
   // that it can be read by the input format.
-  private void recordValidWriteIds(HiveTxnManager txnMgr) throws LockException {
+  private ValidTxnWriteIdList recordValidWriteIds(HiveTxnManager txnMgr) throws LockException {
     String txnString = conf.get(ValidTxnList.VALID_TXNS_KEY);
     if ((txnString == null) || (txnString.isEmpty())) {
       throw new IllegalStateException("calling recordValidWritsIdss() without initializing ValidTxnList " +
@@ -1425,11 +1085,18 @@ public class Driver implements IDriver {
     List<String> txnTables = getTransactionalTableList(plan);
     ValidTxnWriteIdList txnWriteIds = null;
     if (compactionWriteIds != null) {
+      /**
+       * This is kludgy: here we need to read with Compactor's snapshot/txn
+       * rather than the snapshot of the current {@code txnMgr}, in effect
+       * simulating a "flashback query" but can't actually share compactor's
+       * txn since it would run multiple statements.  See more comments in
+       * {@link org.apache.hadoop.hive.ql.txn.compactor.Worker} where it start
+       * the compactor txn*/
       if (txnTables.size() != 1) {
         throw new LockException("Unexpected tables in compaction: " + txnTables);
       }
       String fullTableName = txnTables.get(0);
-      txnWriteIds = new ValidTxnWriteIdList(0L); // No transaction for the compaction for now.
+      txnWriteIds = new ValidTxnWriteIdList(compactorTxnId);
       txnWriteIds.addTableValidWriteIdList(compactionWriteIds);
     } else {
       txnWriteIds = txnMgr.getValidWriteIds(txnTables, txnString);
@@ -1459,6 +1126,7 @@ public class Driver implements IDriver {
       }
     }
     LOG.debug("Encoding valid txn write ids info " + writeIdStr + " txnid:" + txnMgr.getCurrentTxnId());
+    return txnWriteIds;
   }
 
   // Make the list of transactional tables list which are getting read or written by current txn
@@ -1595,10 +1263,16 @@ public class Driver implements IDriver {
         }
       }
 
-      // Note: the sinks and DDL cannot coexist at this time; but if they could we would
-      //       need to make sure we don't get two write IDs for the same table.
+      if (plan.getAcidAnalyzeTable() != null) {
+        // Allocate write ID for the table being analyzed.
+        Table t = plan.getAcidAnalyzeTable().getTable();
+        queryTxnMgr.getTableWriteId(t.getDbName(), t.getTableName());
+      }
+
+
       DDLDescWithWriteId acidDdlDesc = plan.getAcidDdlDesc();
-      if (acidDdlDesc != null && acidDdlDesc.mayNeedWriteId()) {
+      boolean hasAcidDdl = acidDdlDesc != null && acidDdlDesc.mayNeedWriteId();
+      if (hasAcidDdl) {
         String fqTableName = acidDdlDesc.getFullTableName();
         long writeId = queryTxnMgr.getTableWriteId(
             Utilities.getDatabaseName(fqTableName), Utilities.getTableName(fqTableName));
@@ -1610,12 +1284,16 @@ public class Driver implements IDriver {
       queryTxnMgr.acquireLocks(plan, ctx, userFromUGI, lDrvState);
       // This check is for controlling the correctness of the current state
       if (queryTxnMgr.recordSnapshot(plan) && !validTxnListsGenerated) {
-        throw new IllegalStateException("calling recordValidTxn() more than once in the same " +
-            JavaUtils.txnIdToString(queryTxnMgr.getCurrentTxnId()));
+        throw new IllegalStateException(
+            "Need to record valid WriteID list but there is no valid TxnID list (" +
+                JavaUtils.txnIdToString(queryTxnMgr.getCurrentTxnId()) +
+                ", queryId:" + plan.getQueryId() + ")");
       }
-      if (plan.hasAcidResourcesInQuery()) {
+
+      if (plan.hasAcidResourcesInQuery() || hasAcidDdl) {
         recordValidWriteIds(queryTxnMgr);
       }
+
     } catch (Exception e) {
       errorMessage = "FAILED: Error in acquiring locks: " + e.getMessage();
       SQLState = ErrorMsg.findSQLState(e.getMessage());
@@ -1800,105 +1478,44 @@ public class Driver implements IDriver {
     }
   }
 
-  private static final ReentrantLock globalCompileLock = new ReentrantLock();
-
   private void compileInternal(String command, boolean deferClose) throws CommandProcessorResponse {
     Metrics metrics = MetricsFactory.getInstance();
     if (metrics != null) {
       metrics.incrementCounter(MetricsConstant.WAITING_COMPILE_OPS, 1);
     }
 
-    PerfLogger perfLogger = SessionState.getPerfLogger();
+    PerfLogger perfLogger = SessionState.getPerfLogger(true);
     perfLogger.PerfLogBegin(CLASS_NAME, PerfLogger.WAIT_COMPILE);
-    final ReentrantLock compileLock = tryAcquireCompileLock(isParallelEnabled,
-      command);
-    perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.WAIT_COMPILE);
-    if (metrics != null) {
-      metrics.decrementCounter(MetricsConstant.WAITING_COMPILE_OPS, 1);
-    }
 
-    if (compileLock == null) {
-      throw createProcessorResponse(ErrorMsg.COMPILE_LOCK_TIMED_OUT.getErrorCode());
-    }
+    try (CompileLock compileLock = CompileLockFactory.newInstance(conf, command)) {
+      boolean success = compileLock.tryAcquire();
 
+      perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.WAIT_COMPILE);
 
-    try {
-      compile(command, true, deferClose);
-    } catch (CommandProcessorResponse cpr) {
-      try {
-        releaseLocksAndCommitOrRollback(false);
-      } catch (LockException e) {
-        LOG.warn("Exception in releasing locks. " + org.apache.hadoop.util.StringUtils.stringifyException(e));
+      if (metrics != null) {
+        metrics.decrementCounter(MetricsConstant.WAITING_COMPILE_OPS, 1);
       }
-      throw cpr;
-    } finally {
-      compileLock.unlock();
-    }
+      if (!success) {
+        errorMessage = ErrorMsg.COMPILE_LOCK_TIMED_OUT.getErrorCodedMsg();
+        throw createProcessorResponse(ErrorMsg.COMPILE_LOCK_TIMED_OUT.getErrorCode());
+      }
 
+      try {
+        compile(command, true, deferClose);
+      } catch (CommandProcessorResponse cpr) {
+        try {
+          releaseLocksAndCommitOrRollback(false);
+        } catch (LockException e) {
+          LOG.warn("Exception in releasing locks. " + org.apache.hadoop.util.StringUtils.stringifyException(e));
+        }
+        throw cpr;
+      }
+    }
     //Save compile-time PerfLogging for WebUI.
     //Execution-time Perf logs are done by either another thread's PerfLogger
     //or a reset PerfLogger.
     queryDisplay.setPerfLogStarts(QueryDisplay.Phase.COMPILATION, perfLogger.getStartTimes());
     queryDisplay.setPerfLogEnds(QueryDisplay.Phase.COMPILATION, perfLogger.getEndTimes());
-  }
-
-  /**
-   * Acquires the compile lock. If the compile lock wait timeout is configured,
-   * it will acquire the lock if it is not held by another thread within the given
-   * waiting time.
-   * @return the ReentrantLock object if the lock was successfully acquired,
-   *         or {@code null} if compile lock wait timeout is configured and
-   *         either the waiting time elapsed before the lock could be acquired
-   *         or if the current thread is interrupted.
-   */
-  private ReentrantLock tryAcquireCompileLock(boolean isParallelEnabled,
-    String command) {
-    final ReentrantLock compileLock = isParallelEnabled ?
-        SessionState.get().getCompileLock() : globalCompileLock;
-    long maxCompileLockWaitTime = HiveConf.getTimeVar(
-      this.conf, ConfVars.HIVE_SERVER2_COMPILE_LOCK_TIMEOUT,
-      TimeUnit.SECONDS);
-
-    final String lockAcquiredMsg = "Acquired the compile lock.";
-    // First shot without waiting.
-    try {
-      if (compileLock.tryLock(0, TimeUnit.SECONDS)) {
-        LOG.debug(lockAcquiredMsg);
-        return compileLock;
-      }
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      if (LOG.isDebugEnabled()) {
-        LOG.debug("Interrupted Exception ignored", e);
-      }
-      return null;
-    }
-
-    // If the first shot fails, then we log the waiting messages.
-    if (LOG.isDebugEnabled()) {
-      LOG.debug("Waiting to acquire compile lock: " + command);
-    }
-
-    if (maxCompileLockWaitTime > 0) {
-      try {
-        if(!compileLock.tryLock(maxCompileLockWaitTime, TimeUnit.SECONDS)) {
-          errorMessage = ErrorMsg.COMPILE_LOCK_TIMED_OUT.getErrorCodedMsg();
-          LOG.error(errorMessage + ": " + command);
-          return null;
-        }
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        if (LOG.isDebugEnabled()) {
-          LOG.debug("Interrupted Exception ignored", e);
-        }
-        return null;
-      }
-    } else {
-      compileLock.lock();
-    }
-
-    LOG.debug(lockAcquiredMsg);
-    return compileLock;
   }
 
   private void runInternal(String command, boolean alreadyCompiled) throws CommandProcessorResponse {
@@ -1942,19 +1559,18 @@ public class Driver implements IDriver {
         throw createProcessorResponse(12);
       }
 
-      PerfLogger perfLogger = null;
-
       if (!alreadyCompiled) {
         // compile internal will automatically reset the perf logger
         compileInternal(command, true);
-        // then we continue to use this perf logger
-        perfLogger = SessionState.getPerfLogger();
       } else {
-        // reuse existing perf logger.
-        perfLogger = SessionState.getPerfLogger();
         // Since we're reusing the compiled plan, we need to update its start time for current run
-        plan.setQueryStartTime(perfLogger.getStartTime(PerfLogger.DRIVER_RUN));
+        plan.setQueryStartTime(queryDisplay.getQueryStartTime());
       }
+
+      //Reset the PerfLogger so that it doesn't retain any previous values.
+      // Any value from compilation phase can be obtained through the map set in queryDisplay during compilation.
+      PerfLogger perfLogger = SessionState.getPerfLogger(true);
+
       // the reason that we set the txn manager for the cxt here is because each
       // query has its own ctx object. The txn mgr is shared across the
       // same instance of Driver, which can run multiple queries.
@@ -2023,14 +1639,17 @@ public class Driver implements IDriver {
         else if(plan.getOperation() == HiveOperation.ROLLBACK) {
           releaseLocksAndCommitOrRollback(false);
         }
-        else {
+        else if (!queryTxnMgr.isTxnOpen() && queryState.getHiveOperation() == HiveOperation.REPLLOAD) {
+          // repl load during migration, commits the explicit txn and start some internal txns. Call
+          // releaseLocksAndCommitOrRollback to clean up.
+          releaseLocksAndCommitOrRollback(false);
+        } else {
           //txn (if there is one started) is not finished
         }
       } catch (LockException e) {
         throw handleHiveException(e, 12);
       }
 
-      perfLogger.PerfLogEnd(CLASS_NAME, PerfLogger.DRIVER_RUN);
       queryDisplay.setPerfLogStarts(QueryDisplay.Phase.EXECUTION, perfLogger.getStartTimes());
       queryDisplay.setPerfLogEnds(QueryDisplay.Phase.EXECUTION, perfLogger.getEndTimes());
 
@@ -2222,7 +1841,7 @@ public class Driver implements IDriver {
     int maxlen = conf.getIntVar(HiveConf.ConfVars.HIVEJOBNAMELENGTH);
     Metrics metrics = MetricsFactory.getInstance();
 
-    String queryId = queryState.getQueryId();
+    String queryId = plan.getQueryId();
     // Get the query string from the conf file as the compileInternal() method might
     // hide sensitive information during query redaction.
     String queryStr = conf.getQueryString();
@@ -2512,11 +2131,18 @@ public class Driver implements IDriver {
       Map<String, MapRedStats> stats = SessionState.get().getMapRedStats();
       if (stats != null && !stats.isEmpty()) {
         long totalCpu = 0;
+        long numModifiedRows = 0;
         console.printInfo("MapReduce Jobs Launched: ");
         for (Map.Entry<String, MapRedStats> entry : stats.entrySet()) {
           console.printInfo("Stage-" + entry.getKey() + ": " + entry.getValue());
           totalCpu += entry.getValue().getCpuMSec();
+
+          if (numModifiedRows > -1) {
+            //if overflow, then numModifiedRows is set as -1. Else update numModifiedRows with the sum.
+            numModifiedRows = addWithOverflowCheck(numModifiedRows, entry.getValue().getNumModifiedRows());
+          }
         }
+        queryState.setNumModifiedRows(numModifiedRows);
         console.printInfo("Total MapReduce CPU Time Spent: " + Utilities.formatMsecToStr(totalCpu));
       }
       lDrvState.stateLock.lock();
@@ -2534,6 +2160,14 @@ public class Driver implements IDriver {
 
     if (console != null) {
       console.printInfo("OK");
+    }
+  }
+
+  private long addWithOverflowCheck(long val1, long val2) {
+    try {
+      return Math.addExact(val1, val2);
+    } catch (ArithmeticException e) {
+      return -1;
     }
   }
 
@@ -2597,7 +2231,11 @@ public class Driver implements IDriver {
     if(downstreamError != null) {
       //here we assume that upstream code may have parametrized the msg from ErrorMsg
       //so we want to keep it
-      errorMessage += ". " + downstreamError.getMessage();
+      if (downstreamError.getMessage() != null) {
+        errorMessage += ". " + downstreamError.getMessage();
+      } else {
+        errorMessage += ". " + org.apache.hadoop.util.StringUtils.stringifyException(downstreamError);
+      }
     }
     else {
       ErrorMsg em = ErrorMsg.getErrorMsg(exitVal);
@@ -2647,11 +2285,11 @@ public class Driver implements IDriver {
       console.printInfo("Launching Job " + cxt.getCurJobNo() + " out of " + jobs);
     }
     tsk.initialize(queryState, plan, cxt, ctx.getOpContext());
-    TaskRunner tskRun = new TaskRunner(tsk);
+    TaskRunner tskRun = new TaskRunner(tsk, cxt);
 
     cxt.launching(tskRun);
     // Launch Task
-    if (HiveConf.getBoolVar(conf, HiveConf.ConfVars.EXECPARALLEL) && tsk.canExecuteInParallel()) {
+    if (HiveConf.getBoolVar(tsk.getConf(), HiveConf.ConfVars.EXECPARALLEL) && tsk.canExecuteInParallel()) {
       // Launch it in the parallel mode, as a separate thread only for MR tasks
       if (LOG.isInfoEnabled()){
         LOG.info("Starting task [" + tsk + "] in parallel");
@@ -2981,7 +2619,8 @@ public class Driver implements IDriver {
     }
   }
 
-  public void setCompactionWriteIds(ValidWriteIdList val) {
+  public void setCompactionWriteIds(ValidWriteIdList val, long compactorTxnId) {
     this.compactionWriteIds = val;
+    this.compactorTxnId = compactorTxnId;
   }
 }

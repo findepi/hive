@@ -26,6 +26,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -40,6 +41,7 @@ import org.apache.hadoop.hive.io.HdfsUtils;
 import org.apache.hadoop.hive.metastore.HiveMetaHookLoader;
 import org.apache.hadoop.hive.metastore.HiveMetaStoreClient;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
+import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.Warehouse;
 import org.apache.hadoop.hive.metastore.api.AlreadyExistsException;
 import org.apache.hadoop.hive.metastore.api.ColumnStatistics;
@@ -158,7 +160,26 @@ public class SessionHiveMetaStoreClient extends HiveMetaStoreClient implements I
   }
 
   @Override
+  public void truncateTable(String dbName, String tableName,
+      List<String> partNames, String validWriteIds, long writeId)
+      throws TException {
+    org.apache.hadoop.hive.metastore.api.Table table = getTempTable(dbName, tableName);
+    if (table != null) {
+      truncateTempTable(table);
+      return;
+    }
+    super.truncateTable(dbName, tableName, partNames, validWriteIds, writeId);
+  }
+
+  @Override
   public org.apache.hadoop.hive.metastore.api.Table getTable(String dbname, String name) throws MetaException,
+  TException, NoSuchObjectException {
+    return getTable(dbname, name, false, null);
+  }
+
+  @Override
+  public org.apache.hadoop.hive.metastore.api.Table getTable(String dbname, String name,
+  boolean getColStats, String engine) throws MetaException,
   TException, NoSuchObjectException {
     // First check temp tables
     org.apache.hadoop.hive.metastore.api.Table table = getTempTable(dbname, name);
@@ -166,7 +187,7 @@ public class SessionHiveMetaStoreClient extends HiveMetaStoreClient implements I
       return deepCopy(table);  // Original method used deepCopy(), do the same here.
     }
     // Try underlying client
-    return super.getTable(MetaStoreUtils.getDefaultCatalog(conf), dbname, name);
+    return super.getTable(MetaStoreUtils.getDefaultCatalog(conf), dbname, name, getColStats, engine);
   }
 
   // Need to override this one too or dropTable breaks because it doesn't find the table when checks
@@ -174,10 +195,19 @@ public class SessionHiveMetaStoreClient extends HiveMetaStoreClient implements I
   @Override
   public org.apache.hadoop.hive.metastore.api.Table getTable(String catName, String dbName,
                                                              String tableName) throws TException {
+    return getTable(catName, dbName, tableName, false, null);
+  }
+
+  // Need to override this one too or dropTable breaks because it doesn't find the table when checks
+  // before the drop.
+  @Override
+  public org.apache.hadoop.hive.metastore.api.Table getTable(String catName, String dbName,
+          String tableName, boolean getColStats, String engine)
+          throws TException {
     if (!DEFAULT_CATALOG_NAME.equals(catName)) {
-      return super.getTable(catName, dbName, tableName);
+      return super.getTable(catName, dbName, tableName, getColStats, engine);
     } else {
-      return getTable(dbName, tableName);
+      return getTable(dbName, tableName, getColStats, engine);
     }
   }
 
@@ -229,6 +259,46 @@ public class SessionHiveMetaStoreClient extends HiveMetaStoreClient implements I
     combinedTableNames.addAll(tableNames);
     tableNames = new ArrayList<String>(combinedTableNames);
     Collections.sort(tableNames);
+    return tableNames;
+  }
+
+  @Override
+  public List<String> getTables(String dbname, String tablePattern, TableType tableType) throws MetaException {
+    List<String> tableNames = super.getTables(dbname, tablePattern, tableType);
+
+    if (tableType == TableType.MANAGED_TABLE || tableType == TableType.EXTERNAL_TABLE) {
+      // May need to merge with list of temp tables
+      dbname = dbname.toLowerCase();
+      tablePattern = tablePattern.toLowerCase();
+      Map<String, Table> tables = getTempTablesForDatabase(dbname, tablePattern);
+      if (tables == null || tables.size() == 0) {
+        return tableNames;
+      }
+      tablePattern = tablePattern.replaceAll("\\*", ".*");
+      Pattern pattern = Pattern.compile(tablePattern);
+      Matcher matcher = pattern.matcher("");
+      Set<String> combinedTableNames = new HashSet<String>();
+      combinedTableNames.addAll(tableNames);
+      for (Entry<String, Table> tableData : tables.entrySet()) {
+        matcher.reset(tableData.getKey());
+        if (matcher.matches()) {
+          if (tableData.getValue().getTableType() == tableType) {
+            // If tableType is the same that we are requesting,
+            // add table the the list
+            combinedTableNames.add(tableData.getKey());
+          } else {
+            // If tableType is not the same that we are requesting,
+            // remove it in case it was added before, as temp table
+            // overrides original table
+            combinedTableNames.remove(tableData.getKey());
+          }
+        }
+      }
+      // Combine/sort temp and normal table results
+      tableNames = new ArrayList<>(combinedTableNames);
+      Collections.sort(tableNames);
+    }
+
     return tableNames;
   }
 
@@ -348,6 +418,20 @@ public class SessionHiveMetaStoreClient extends HiveMetaStoreClient implements I
   }
 
   @Override
+  public void alter_table(String catName, String dbName, String tbl_name,
+      org.apache.hadoop.hive.metastore.api.Table new_tbl,
+      EnvironmentContext envContext, String validWriteIds)
+      throws InvalidOperationException, MetaException, TException {
+    org.apache.hadoop.hive.metastore.api.Table old_tbl = getTempTable(dbName, tbl_name);
+    if (old_tbl != null) {
+      //actually temp table does not support partitions, cascade is not applicable here
+      alterTempTable(dbName, tbl_name, old_tbl, new_tbl, null);
+      return;
+    }
+    super.alter_table(catName, dbName, tbl_name, new_tbl, envContext, validWriteIds);
+  }
+
+  @Override
   public void alter_table(String dbname, String tbl_name,
       org.apache.hadoop.hive.metastore.api.Table new_tbl) throws InvalidOperationException,
       MetaException, TException {
@@ -412,23 +496,23 @@ public class SessionHiveMetaStoreClient extends HiveMetaStoreClient implements I
   /** {@inheritDoc} */
   @Override
   public List<ColumnStatisticsObj> getTableColumnStatistics(String dbName, String tableName,
-      List<String> colNames) throws NoSuchObjectException, MetaException, TException,
+      List<String> colNames, String engine) throws NoSuchObjectException, MetaException, TException,
       InvalidInputException, InvalidObjectException {
     if (getTempTable(dbName, tableName) != null) {
       return getTempTableColumnStats(dbName, tableName, colNames);
     }
-    return super.getTableColumnStatistics(dbName, tableName, colNames);
+    return super.getTableColumnStatistics(dbName, tableName, colNames, engine);
   }
 
   /** {@inheritDoc} */
   @Override
-  public boolean deleteTableColumnStatistics(String dbName, String tableName, String colName)
+  public boolean deleteTableColumnStatistics(String dbName, String tableName, String colName, String engine)
       throws NoSuchObjectException, InvalidObjectException, MetaException, TException,
       InvalidInputException {
     if (getTempTable(dbName, tableName) != null) {
       return deleteTempTableColumnStats(dbName, tableName, colName);
     }
-    return super.deleteTableColumnStatistics(dbName, tableName, colName);
+    return super.deleteTableColumnStatistics(dbName, tableName, colName, engine);
   }
 
   private void createTempTable(org.apache.hadoop.hive.metastore.api.Table tbl,
@@ -593,7 +677,7 @@ public class SessionHiveMetaStoreClient extends HiveMetaStoreClient implements I
       return false;
     }
     boolean statsPresent = false;
-    for (String stat : StatsSetupConst.supportedStats) {
+    for (String stat : StatsSetupConst.SUPPORTED_STATS) {
       String statVal = props.get(stat);
       if (statVal != null && Long.parseLong(statVal) > 0) {
         statsPresent = true;
@@ -972,16 +1056,26 @@ public class SessionHiveMetaStoreClient extends HiveMetaStoreClient implements I
     }
     return matchedParts;
   }
+
   /**
    * partNames are like "p=1/q=2" type strings.  The values (RHS of =) are escaped.
    */
   @Override
   public List<Partition> getPartitionsByNames(String db_name, String tblName,
       List<String> partNames) throws TException {
+    return getPartitionsByNames(db_name, tblName, partNames, false, null);
+  }
+
+  /**
+   * partNames are like "p=1/q=2" type strings.  The values (RHS of =) are escaped.
+   */
+  @Override
+  public List<Partition> getPartitionsByNames(String db_name, String tblName,
+      List<String> partNames, boolean getColStats, String engine) throws TException {
     org.apache.hadoop.hive.metastore.api.Table table = getTempTable(db_name, tblName);
     if (table == null) {
       //(assume) not a temp table - Try underlying client
-      return super.getPartitionsByNames(db_name, tblName, partNames);
+      return super.getPartitionsByNames(db_name, tblName, partNames, getColStats, engine);
     }
     TempTable tt = getTempTable(table);
     if(tt == null) {

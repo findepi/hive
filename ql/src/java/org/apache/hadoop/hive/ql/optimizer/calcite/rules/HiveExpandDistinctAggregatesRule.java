@@ -165,7 +165,7 @@ public final class HiveExpandDistinctAggregatesRule extends RelOptRule {
     final RelMetadataQuery mq = call.getMetadataQuery();
     if ((nonDistinctCount == 0) && (argListSets.size() == 1)) {
       for (Integer arg : argListSets.iterator().next()) {
-        Set<RelColumnOrigin> colOrigs = mq.getColumnOrigins(aggregate, arg);
+        Set<RelColumnOrigin> colOrigs = mq.getColumnOrigins(aggregate.getInput(), arg);
         if (null != colOrigs) {
           for (RelColumnOrigin colOrig : colOrigs) {
             RelOptHiveTable hiveTbl = (RelOptHiveTable)colOrig.getOriginTable();
@@ -250,8 +250,10 @@ public final class HiveExpandDistinctAggregatesRule extends RelOptRule {
             originalInputRefs.get(pos));
         condition = rexBuilder.makeCall(SqlStdOperatorTable.AND, condition, notNull);
       }
+      RexNode caseExpr1 = rexBuilder.makeExactLiteral(BigDecimal.ONE);
+      RexNode caseExpr2 = rexBuilder.makeNullLiteral(caseExpr1.getType());
       RexNode when = rexBuilder.makeCall(SqlStdOperatorTable.CASE, condition,
-          rexBuilder.makeExactLiteral(BigDecimal.ONE), rexBuilder.constantNull());
+          caseExpr1, caseExpr2);
       gbChildProjLst.add(when);
     }
 

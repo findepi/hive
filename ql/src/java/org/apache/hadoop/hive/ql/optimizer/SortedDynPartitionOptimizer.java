@@ -27,10 +27,15 @@ import java.util.Map;
 import java.util.Set;
 import java.util.Stack;
 
+import java.util.stream.Collectors;
+import org.apache.hadoop.hive.conf.Constants;
+import org.apache.hadoop.hive.conf.HiveConf;
+import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.Order;
 import org.apache.hadoop.hive.ql.exec.ColumnInfo;
 import org.apache.hadoop.hive.ql.exec.FileSinkOperator;
+import org.apache.hadoop.hive.ql.exec.FunctionRegistry;
 import org.apache.hadoop.hive.ql.exec.Operator;
 import org.apache.hadoop.hive.ql.exec.OperatorFactory;
 import org.apache.hadoop.hive.ql.exec.OperatorUtils;
@@ -53,12 +58,14 @@ import org.apache.hadoop.hive.ql.lib.RuleRegExp;
 import org.apache.hadoop.hive.ql.metadata.Table;
 import org.apache.hadoop.hive.ql.metadata.VirtualColumn;
 import org.apache.hadoop.hive.ql.parse.ParseContext;
+import org.apache.hadoop.hive.ql.parse.ParseUtils;
 import org.apache.hadoop.hive.ql.parse.SemanticException;
 import org.apache.hadoop.hive.ql.plan.DynamicPartitionCtx;
 import org.apache.hadoop.hive.ql.plan.ExprNodeColumnDesc;
 import org.apache.hadoop.hive.ql.plan.ExprNodeConstantDesc;
 import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
 import org.apache.hadoop.hive.ql.plan.ExprNodeDescUtils;
+import org.apache.hadoop.hive.ql.plan.ExprNodeGenericFuncDesc;
 import org.apache.hadoop.hive.ql.plan.FileSinkDesc;
 import org.apache.hadoop.hive.ql.plan.ListBucketingCtx;
 import org.apache.hadoop.hive.ql.plan.OperatorDesc;
@@ -82,7 +89,7 @@ import com.google.common.collect.Sets;
  */
 public class SortedDynPartitionOptimizer extends Transform {
 
-  public static final String BUCKET_NUMBER_COL_NAME = "_bucket_number";
+  private static final String BUCKET_NUMBER_COL_NAME = "_bucket_number";
   @Override
   public ParseContext transform(ParseContext pCtx) throws SemanticException {
 
@@ -147,6 +154,14 @@ public class SortedDynPartitionOptimizer extends Transform {
         return null;
       }
 
+      if (destTable.isMaterializedView() &&
+          (destTable.getProperty(Constants.MATERIALIZED_VIEW_SORT_COLUMNS) != null ||
+          destTable.getProperty(Constants.MATERIALIZED_VIEW_DISTRIBUTE_COLUMNS) != null)) {
+        LOG.debug("Bailing out of sort dynamic partition optimization as destination is a materialized view"
+            + "with CLUSTER/SORT/DISTRIBUTE spec");
+        return null;
+      }
+
       // unlink connection between FS and its parent
       Operator<? extends OperatorDesc> fsParent = fsOp.getParentOperators().get(0);
       // if all dp columns got constant folded then disable this optimization
@@ -172,7 +187,7 @@ public class SortedDynPartitionOptimizer extends Transform {
 
       // unlink connection between FS and its parent
       fsParent = fsOp.getParentOperators().get(0);
-      fsParent.getChildOperators().clear();
+      fsParent.getChildOperators().remove(fsOp);
 
       DynamicPartitionCtx dpCtx = fsOp.getConf().getDynPartCtx();
       int numBuckets = destTable.getNumBuckets();
@@ -206,13 +221,18 @@ public class SortedDynPartitionOptimizer extends Transform {
         if(!VirtualColumn.ROWID.getTypeInfo().equals(ci.getType())) {
           throw new IllegalStateException("expected 1st column to be ROW__ID but got wrong type: " + ci.toString());
         }
-        //HIVE-17328: not sure this is correct... I don't think is gets wrapped in UDFToInteger....
-        bucketColumns.add(new ExprNodeColumnDesc(ci));
+        //add a cast(ROW__ID as int) to wrap in UDFToInteger()
+        bucketColumns.add(ParseUtils.createConversionCast(new ExprNodeColumnDesc(ci), TypeInfoFactory.intTypeInfo));
       } else {
         if (!destTable.getSortCols().isEmpty()) {
           // Sort columns specified by table
           sortPositions = getSortPositions(destTable.getSortCols(), destTable.getCols());
           sortOrder = getSortOrders(destTable.getSortCols(), destTable.getCols());
+        } else if (HiveConf.getBoolVar(this.parseCtx.getConf(), HiveConf.ConfVars.HIVE_SORT_WHEN_BUCKETING) &&
+            !bucketPositions.isEmpty()) {
+          // We use clustered columns as sort columns
+          sortPositions = new ArrayList<>(bucketPositions);
+          sortOrder = sortPositions.stream().map(e -> 1).collect(Collectors.toList());
         } else {
           // Infer sort columns from operator tree
           sortPositions = Lists.newArrayList();
@@ -262,8 +282,8 @@ public class SortedDynPartitionOptimizer extends Transform {
       }
       RowSchema selRS = new RowSchema(fsParent.getSchema());
       if (!bucketColumns.isEmpty()) {
-        descs.add(new ExprNodeColumnDesc(TypeInfoFactory.stringTypeInfo, ReduceField.KEY.toString()+".'"+BUCKET_NUMBER_COL_NAME+"'", null, false));
-        colNames.add("'"+BUCKET_NUMBER_COL_NAME+"'");
+        descs.add(new ExprNodeColumnDesc(TypeInfoFactory.stringTypeInfo, ReduceField.KEY.toString()+"."+BUCKET_NUMBER_COL_NAME, null, false));
+        colNames.add(BUCKET_NUMBER_COL_NAME);
         ColumnInfo ci = new ColumnInfo(BUCKET_NUMBER_COL_NAME, TypeInfoFactory.stringTypeInfo, selRS.getSignature().get(0).getTabAlias(), true, true);
         selRS.getSignature().add(ci);
         fsParent.getSchema().getSignature().add(ci);
@@ -365,7 +385,15 @@ public class SortedDynPartitionOptimizer extends Transform {
               rsChild.getSchema().getSignature().size()) {
             return false;
           }
-          rsParent.getChildOperators().clear();
+          // if child is select and contains expression which isn't column it shouldn't
+          // be removed because otherwise we will end up with different types/schema later
+          // while introducing select for RS
+          for(ExprNodeDesc expr: rsChild.getColumnExprMap().values()){
+            if(!(expr instanceof ExprNodeColumnDesc)){
+              return false;
+            }
+          }
+          rsParent.getChildOperators().remove(rsToRemove);
           rsParent.getChildOperators().add(rsGrandChild);
           rsGrandChild.getParentOperators().clear();
           rsGrandChild.getParentOperators().add(rsParent);
@@ -513,9 +541,10 @@ public class SortedDynPartitionOptimizer extends Transform {
       // corresponding with bucket number and hence their OIs
       for (Integer idx : keyColsPosInVal) {
         if (idx < 0) {
-          ExprNodeConstantDesc bucketNumCol = new ExprNodeConstantDesc(TypeInfoFactory.stringTypeInfo, BUCKET_NUMBER_COL_NAME);
-          keyCols.add(bucketNumCol);
-          colExprMap.put(Utilities.ReduceField.KEY + ".'" +BUCKET_NUMBER_COL_NAME+"'", bucketNumCol);
+          ExprNodeDesc bucketNumColUDF = ExprNodeGenericFuncDesc.newInstance(
+            FunctionRegistry.getFunctionInfo("bucket_number").getGenericUDF(), new ArrayList<>());
+          keyCols.add(bucketNumColUDF);
+          colExprMap.put(Utilities.ReduceField.KEY + "." +BUCKET_NUMBER_COL_NAME, bucketNumColUDF);
         } else {
           keyCols.add(allCols.get(idx).clone());
         }

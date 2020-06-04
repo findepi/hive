@@ -30,18 +30,19 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 
-import com.google.common.base.Preconditions;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.common.FileUtils;
+import org.apache.hadoop.hive.common.StatsSetupConst;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
 import org.apache.hadoop.hive.metastore.HiveMetaStoreUtils;
 import org.apache.hadoop.hive.metastore.TableType;
 import org.apache.hadoop.hive.metastore.Warehouse;
+import org.apache.hadoop.hive.metastore.api.ColumnStatistics;
 import org.apache.hadoop.hive.metastore.api.CreationMetadata;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.MetaException;
@@ -75,6 +76,8 @@ import org.apache.hive.common.util.ReflectionUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.base.Preconditions;
+
 /**
  * A Hive Table: is a fundamental unit of data in Hive that shares a common schema/DDL.
  *
@@ -99,10 +102,23 @@ public class Table implements Serializable {
   private Path path;
 
   private transient HiveStorageHandler storageHandler;
+  private transient StorageHandlerInfo storageHandlerInfo;
 
   private transient TableSpec tableSpec;
 
   private transient boolean materializedTable;
+
+  /** Note: This is set only for describe table purposes, it cannot be used to verify whether
+   * a materialization is up-to-date or not. */
+  private transient Boolean outdatedForRewritingMaterializedView;
+
+  /** Constraint related objects */
+  private transient PrimaryKeyInfo pki;
+  private transient ForeignKeyInfo fki;
+  private transient UniqueConstraint uki;
+  private transient NotNullConstraint nnc;
+  private transient DefaultConstraint dc;
+  private transient CheckConstraint cc;
 
   /**
    * Used only for serialization.
@@ -305,6 +321,14 @@ public class Table implements Serializable {
       throw new RuntimeException(e);
     }
     return storageHandler;
+  }
+
+  public StorageHandlerInfo getStorageHandlerInfo() {
+    return storageHandlerInfo;
+  }
+
+  public void setStorageHandlerInfo(StorageHandlerInfo storageHandlerInfo) {
+    this.storageHandlerInfo = storageHandlerInfo;
   }
 
   final public Class<? extends InputFormat> getInputFormatClass() {
@@ -555,7 +579,7 @@ public class Table implements Serializable {
 
   public void setDataLocation(Path path) {
     this.path = path;
-    tTable.getSd().setLocation(path.toString());
+    tTable.getSd().setLocation(path == null ? null : path.toString());
   }
 
   public void unsetDataLocation() {
@@ -1010,6 +1034,10 @@ public class Table implements Serializable {
     return tTable.isTemporary();
   }
 
+  public void setTemporary(boolean isTemporary) {
+    tTable.setTemporary(isTemporary);
+  }
+
   public static boolean hasMetastoreBasedSchema(HiveConf conf, String serdeLib) {
     return StringUtils.isEmpty(serdeLib) ||
         conf.getStringCollection(ConfVars.SERDESUSINGMETASTOREFORSCHEMA.varname).contains(serdeLib);
@@ -1081,5 +1109,87 @@ public class Table implements Serializable {
 
   public boolean hasDeserializer() {
     return deserializer != null;
+  }
+
+  public String getCatalogName() {
+    return this.tTable.getCatName();
+  }
+
+  public void setOutdatedForRewriting(Boolean validForRewritingMaterializedView) {
+    this.outdatedForRewritingMaterializedView = validForRewritingMaterializedView;
+  }
+
+  /** Note: This is set only for describe table purposes, it cannot be used to verify whether
+   * a materialization is up-to-date or not. */
+  public Boolean isOutdatedForRewriting() {
+    return outdatedForRewritingMaterializedView;
+  }
+
+  /* These are only populated during optimization and describing */
+  public PrimaryKeyInfo getPrimaryKeyInfo() {
+    return pki;
+  }
+
+  public void setPrimaryKeyInfo(PrimaryKeyInfo pki) {
+    this.pki = pki;
+  }
+
+  public ForeignKeyInfo getForeignKeyInfo() {
+    return fki;
+  }
+
+  public void setForeignKeyInfo(ForeignKeyInfo fki) {
+    this.fki = fki;
+  }
+
+  public UniqueConstraint getUniqueKeyInfo() {
+    return uki;
+  }
+
+  public void setUniqueKeyInfo(UniqueConstraint uki) {
+    this.uki = uki;
+  }
+
+  public NotNullConstraint getNotNullConstraint() {
+    return nnc;
+  }
+
+  public void setNotNullConstraint(NotNullConstraint nnc) {
+    this.nnc = nnc;
+  }
+
+  public DefaultConstraint getDefaultConstraint() {
+    return dc;
+  }
+
+  public void setDefaultConstraint(DefaultConstraint dc) {
+    this.dc = dc;
+  }
+
+  public CheckConstraint getCheckConstraint() {
+    return cc;
+  }
+
+  public void setCheckConstraint(CheckConstraint cc) {
+    this.cc = cc;
+  }
+
+
+  public ColumnStatistics getColStats() {
+    return tTable.isSetColStats() ? tTable.getColStats() : null;
+  }
+
+  /**
+   * Setup the table level stats as if the table is new. Used when setting up Table for a new
+   * table or during replication.
+   */
+  public void setStatsStateLikeNewTable() {
+    if (isPartitioned()) {
+      StatsSetupConst.setStatsStateForCreateTable(getParameters(), null,
+              StatsSetupConst.FALSE);
+    } else {
+      StatsSetupConst.setStatsStateForCreateTable(getParameters(),
+              MetaStoreUtils.getColumnNames(getCols()), StatsSetupConst.TRUE);
+    }
   }
 };

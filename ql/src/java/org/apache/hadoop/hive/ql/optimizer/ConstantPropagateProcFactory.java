@@ -63,7 +63,6 @@ import org.apache.hadoop.hive.ql.plan.JoinCondDesc;
 import org.apache.hadoop.hive.ql.plan.JoinDesc;
 import org.apache.hadoop.hive.ql.plan.ReduceSinkDesc;
 import org.apache.hadoop.hive.ql.plan.TableScanDesc;
-import org.apache.hadoop.hive.ql.udf.UDFType;
 import org.apache.hadoop.hive.ql.udf.generic.GenericUDF;
 import org.apache.hadoop.hive.ql.udf.generic.GenericUDF.DeferredJavaObject;
 import org.apache.hadoop.hive.ql.udf.generic.GenericUDFBaseCompare;
@@ -471,7 +470,7 @@ public final class ConstantPropagateProcFactory {
   private static boolean isConstantFoldableUdf(GenericUDF udf,  List<ExprNodeDesc> children) {
     // Runtime constants + deterministic functions can be folded.
     if (!FunctionRegistry.isConsistentWithinQuery(udf)) {
-      if (udf.getClass().equals(GenericUDFUnixTimeStamp.class) 
+      if (udf.getClass().equals(GenericUDFUnixTimeStamp.class)
           && children != null && children.size() > 0) {
         // unix_timestamp is polymorphic (ignore class annotations)
         return true;
@@ -589,7 +588,7 @@ public final class ConstantPropagateProcFactory {
        return null;
      }
      GenericUDF childUDF = caseOrWhenexpr.getGenericUDF();
-     List<ExprNodeDesc> children = caseOrWhenexpr.getChildren();
+      List<ExprNodeDesc> children = new ArrayList(caseOrWhenexpr.getChildren());
      int i;
      if (childUDF instanceof GenericUDFWhen) {
        for (i = 1; i < children.size(); i+=2) {
@@ -640,8 +639,10 @@ public final class ConstantPropagateProcFactory {
             // if true, prune it
             positionsToRemove.set(i);
           } else {
-            // if false, return false
-            return childExpr;
+            if (Boolean.FALSE.equals(c.getValue())) {
+              // if false, return false
+              return childExpr;
+            }
           }
         } else if (childExpr instanceof ExprNodeGenericFuncDesc &&
                 ((ExprNodeGenericFuncDesc)childExpr).getGenericUDF() instanceof GenericUDFOPNotNull &&
@@ -1204,11 +1205,17 @@ public final class ConstantPropagateProcFactory {
             if (HiveConf.getPositionFromInternalName(colName) == -1) {
               // if its not an internal name, this is what we want.
               ((ExprNodeConstantDesc)newCol).setFoldedFromCol(colName);
+              // See if we can set the tabAlias this was folded from as well.
+              ExprNodeDesc colExpr = colList.get(i);
+              if (colExpr instanceof ExprNodeColumnDesc) {
+                ((ExprNodeConstantDesc)newCol).setFoldedFromTab(((ExprNodeColumnDesc) colExpr).getTabAlias());
+              }
             } else {
               // If it was internal column, lets try to get name from columnExprMap
               ExprNodeDesc desc = columnExprMap.get(colName);
               if (desc instanceof ExprNodeConstantDesc) {
                 ((ExprNodeConstantDesc)newCol).setFoldedFromCol(((ExprNodeConstantDesc)desc).getFoldedFromCol());
+                ((ExprNodeConstantDesc)newCol).setFoldedFromTab(((ExprNodeConstantDesc)desc).getFoldedFromTab());
               }
             }
           }
@@ -1369,7 +1376,7 @@ public final class ConstantPropagateProcFactory {
       for (ExprNodeDesc desc : rsDesc.getKeyCols()) {
         ExprNodeDesc newDesc = foldExpr(desc, constants, cppCtx, op, 0, false);
         if (newDesc != desc && desc instanceof ExprNodeColumnDesc && newDesc instanceof ExprNodeConstantDesc) {
-          ((ExprNodeConstantDesc)newDesc).setFoldedFromCol(((ExprNodeColumnDesc)desc).getColumn());
+          ((ExprNodeConstantDesc)newDesc).setFoldedTabCol((ExprNodeColumnDesc)desc);
         }
         newKeyEpxrs.add(newDesc);
       }
@@ -1381,7 +1388,7 @@ public final class ConstantPropagateProcFactory {
         ExprNodeDesc expr = foldExpr(desc, constants, cppCtx, op, 0, false);
         if (expr != desc && desc instanceof ExprNodeColumnDesc
             && expr instanceof ExprNodeConstantDesc) {
-          ((ExprNodeConstantDesc) expr).setFoldedFromCol(((ExprNodeColumnDesc) desc).getColumn());
+          ((ExprNodeConstantDesc) expr).setFoldedTabCol((ExprNodeColumnDesc) desc);
         }
         newPartExprs.add(expr);
       }

@@ -18,22 +18,26 @@
 
 package org.apache.hadoop.hive.ql.parse;
 
+import com.google.common.collect.Multimap;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.ql.Context;
 import org.apache.hadoop.hive.ql.QueryProperties;
 import org.apache.hadoop.hive.ql.QueryState;
+import org.apache.hadoop.hive.ql.ddl.table.creation.CreateTableDesc;
+import org.apache.hadoop.hive.ql.ddl.view.CreateViewDesc;
+import org.apache.hadoop.hive.ql.ddl.view.MaterializedViewUpdateDesc;
 import org.apache.hadoop.hive.ql.exec.AbstractMapJoinOperator;
 import org.apache.hadoop.hive.ql.exec.FetchTask;
 import org.apache.hadoop.hive.ql.exec.GroupByOperator;
 import org.apache.hadoop.hive.ql.exec.JoinOperator;
 import org.apache.hadoop.hive.ql.exec.ListSinkOperator;
 import org.apache.hadoop.hive.ql.exec.MapJoinOperator;
-import org.apache.hadoop.hive.ql.exec.MaterializedViewDesc;
 import org.apache.hadoop.hive.ql.exec.Operator;
 import org.apache.hadoop.hive.ql.exec.ReduceSinkOperator;
 import org.apache.hadoop.hive.ql.exec.SMBMapJoinOperator;
 import org.apache.hadoop.hive.ql.exec.SelectOperator;
 import org.apache.hadoop.hive.ql.exec.TableScanOperator;
+import org.apache.hadoop.hive.ql.exec.TerminalOperator;
 import org.apache.hadoop.hive.ql.exec.Task;
 import org.apache.hadoop.hive.ql.hooks.LineageInfo;
 import org.apache.hadoop.hive.ql.hooks.ReadEntity;
@@ -41,8 +45,6 @@ import org.apache.hadoop.hive.ql.metadata.Table;
 import org.apache.hadoop.hive.ql.optimizer.ppr.PartitionPruner;
 import org.apache.hadoop.hive.ql.optimizer.unionproc.UnionProcContext;
 import org.apache.hadoop.hive.ql.parse.BaseSemanticAnalyzer.AnalyzeRewriteContext;
-import org.apache.hadoop.hive.ql.plan.CreateTableDesc;
-import org.apache.hadoop.hive.ql.plan.CreateViewDesc;
 import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
 import org.apache.hadoop.hive.ql.plan.FileSinkDesc;
 import org.apache.hadoop.hive.ql.plan.FilterDesc.SampleDesc;
@@ -57,6 +59,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -119,7 +122,7 @@ public class ParseContext {
   private AnalyzeRewriteContext analyzeRewrite;
   private CreateTableDesc createTableDesc;
   private CreateViewDesc createViewDesc;
-  private MaterializedViewDesc materializedViewUpdateDesc;
+  private MaterializedViewUpdateDesc materializedViewUpdateDesc;
   private boolean reduceSinkAddedBySortedDynPartition;
 
   private Map<SelectOperator, Table> viewProjectToViewSchema;
@@ -128,7 +131,7 @@ public class ParseContext {
   private Set<FileSinkDesc> acidFileSinks = Collections.emptySet();
 
   private Map<ReduceSinkOperator, RuntimeValuesInfo> rsToRuntimeValuesInfo =
-          new HashMap<ReduceSinkOperator, RuntimeValuesInfo>();
+          new LinkedHashMap<ReduceSinkOperator, RuntimeValuesInfo>();
   private Map<ReduceSinkOperator, SemiJoinBranchInfo> rsToSemiJoinBranchInfo =
           new HashMap<>();
   private Map<ExprNodeDesc, GroupByOperator> colExprToGBMap =
@@ -136,6 +139,7 @@ public class ParseContext {
 
   private Map<String, List<SemiJoinHint>> semiJoinHints;
   private boolean disableMapJoin;
+  private Multimap<TerminalOperator<?>, ReduceSinkOperator> terminalOpToRSMap;
 
   public ParseContext() {
   }
@@ -195,7 +199,8 @@ public class ParseContext {
       Map<String, ReadEntity> viewAliasToInput,
       List<ReduceSinkOperator> reduceSinkOperatorsAddedByEnforceBucketingSorting,
       AnalyzeRewriteContext analyzeRewrite, CreateTableDesc createTableDesc,
-      CreateViewDesc createViewDesc, MaterializedViewDesc materializedViewUpdateDesc, QueryProperties queryProperties,
+      CreateViewDesc createViewDesc, MaterializedViewUpdateDesc materializedViewUpdateDesc,
+      QueryProperties queryProperties,
       Map<SelectOperator, Table> viewProjectToTableSchema, Set<FileSinkDesc> acidFileSinks) {
     this.queryState = queryState;
     this.conf = queryState.getConf();
@@ -607,7 +612,7 @@ public class ParseContext {
     return createViewDesc;
   }
 
-  public MaterializedViewDesc getMaterializedViewUpdateDesc() {
+  public MaterializedViewUpdateDesc getMaterializedViewUpdateDesc() {
     return materializedViewUpdateDesc;
   }
 
@@ -712,5 +717,13 @@ public class ParseContext {
 
   public boolean getDisableMapJoin() {
     return disableMapJoin;
+  }
+
+  public void setTerminalOpToRSMap(Multimap<TerminalOperator<?>, ReduceSinkOperator> terminalOpToRSMap) {
+    this.terminalOpToRSMap = terminalOpToRSMap;
+  }
+
+  public Multimap<TerminalOperator<?>, ReduceSinkOperator> getTerminalOpToRSMap() {
+    return terminalOpToRSMap;
   }
 }

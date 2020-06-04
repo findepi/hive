@@ -24,15 +24,16 @@ import java.io.OutputStream;
 import java.io.Serializable;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryMXBean;
+import java.security.AccessController;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.Iterator;
 import java.util.List;
-import java.util.Map;
 import java.util.Properties;
 
 import org.apache.commons.lang.StringUtils;
+import org.apache.hadoop.hive.ql.exec.AddToClassPathAction;
 import org.apache.hadoop.hive.ql.exec.SerializationUtilities;
 import org.apache.hadoop.hive.ql.log.LogDivertAppenderForTest;
 import org.apache.hadoop.mapreduce.MRJobConfig;
@@ -174,12 +175,6 @@ public class ExecDriver extends Task<MapredWork> implements Serializable, Hadoop
   public void initialize(QueryState queryState, QueryPlan queryPlan, DriverContext driverContext,
       CompilationOpContext opContext) {
     super.initialize(queryState, queryPlan, driverContext, opContext);
-
-    Iterator<Map.Entry<String, String>> iter = conf.iterator();
-    while(iter.hasNext()) {
-      String key = iter.next().getKey();
-      conf.set(key, conf.get(key));
-    }
 
     job = new JobConf(conf, ExecDriver.class);
 
@@ -465,9 +460,9 @@ public class ExecDriver extends Task<MapredWork> implements Serializable, Hadoop
           jc.close();
         }
       } catch (Exception e) {
-	LOG.warn("Failed while cleaning up ", e);
+        LOG.warn("Failed while cleaning up ", e);
       } finally {
-	HadoopJobExecHelper.runningJobs.remove(rj);
+        HadoopJobExecHelper.runningJobs.remove(rj);
       }
     }
 
@@ -752,7 +747,9 @@ public class ExecDriver extends Task<MapredWork> implements Serializable, Hadoop
       // see also - code in CliDriver.java
       ClassLoader loader = conf.getClassLoader();
       if (StringUtils.isNotBlank(libjars)) {
-        loader = Utilities.addToClassPath(loader, StringUtils.split(libjars, ","));
+        AddToClassPathAction addAction = new AddToClassPathAction(
+            loader, Arrays.asList(StringUtils.split(libjars, ",")));
+        loader = AccessController.doPrivileged(addAction);
       }
       conf.setClassLoader(loader);
       // Also set this to the Thread ContextClassLoader, so new threads will
